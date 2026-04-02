@@ -2129,11 +2129,14 @@ void App::requestProbSevereRefresh(bool force) {
         });
 }
 
-void App::invalidateLiveLoop(bool freeMemory) {
+void App::invalidateLiveLoop(bool freeMemory, bool preservePlayback) {
+    const bool keepPlaying = preservePlayback && m_liveLoopPlaying;
     m_liveLoopBackfillGeneration.fetch_add(1);
     m_liveLoopBackfillLoading = false;
     m_liveLoopBackfillDeferFrames = 0;
     m_liveLoopInteractiveBackfill = false;
+    m_liveLoopViewInteractionFrames = 0;
+    m_liveLoopLocalRefreshPending = false;
     {
         std::lock_guard<std::mutex> lock(m_liveLoopBackfillMutex);
         m_liveLoopBackfillQueue.clear();
@@ -2143,6 +2146,7 @@ void App::invalidateLiveLoop(bool freeMemory) {
     m_liveLoopBackfillFetchCompleted = 0;
     m_liveLoopBackfillReplaceExisting = false;
     resetLiveLoopFrameCache(freeMemory);
+    m_liveLoopPlaying = keepPlaying;
 }
 
 void App::resetLiveLoopFrameCache(bool freeMemory) {
@@ -2175,6 +2179,19 @@ void App::requestLiveLoopCapture() {
     if (!m_liveLoopEnabled || m_historicMode || m_snapshotMode || m_mode3D || m_crossSection)
         return;
     m_liveLoopCapturePending = true;
+}
+
+void App::noteInteractiveViewChange() {
+    if (m_liveLoopEnabled && !m_historicMode && !m_snapshotMode &&
+        !m_showAll && !m_mode3D && !m_crossSection) {
+        m_liveLoopViewInteractionFrames = 8;
+        m_liveLoopLocalRefreshPending = true;
+        requestLiveLoopCapture();
+    } else {
+        invalidateFrameCache(true);
+    }
+    m_needsComposite = true;
+    m_needsRerender = true;
 }
 
 void App::scheduleInteractiveLiveLoopBackfill() {
@@ -4322,13 +4339,18 @@ void App::update(float dt) {
         m_lastLivePollSweep = now;
     }
 
-    if (m_liveLoopLocalRefreshPending.exchange(false) &&
+    if (m_liveLoopViewInteractionFrames > 0)
+        --m_liveLoopViewInteractionFrames;
+
+    if (m_liveLoopViewInteractionFrames <= 0 &&
+        m_liveLoopLocalRefreshPending.exchange(false) &&
         m_liveLoopEnabled && !m_snapshotMode && !m_historicMode &&
         !m_mode3D && !m_crossSection && !m_showAll) {
         requestLiveLoopBackfillForViewRefresh();
     }
 
-    processLiveLoopBackfill();
+    if (m_liveLoopViewInteractionFrames <= 0)
+        processLiveLoopBackfill();
     updateLiveLoop(dt);
     m_basemap.update(m_viewport);
 }
@@ -4368,6 +4390,7 @@ void App::renderPane(int paneIndex, uint32_t* d_output) {
         !m_snapshotMode &&
         !m_mode3D &&
         !m_crossSection &&
+        m_liveLoopViewInteractionFrames <= 0 &&
         m_liveLoopEnabled &&
         m_liveLoopCount > 0 &&
         !capturePending &&
@@ -4571,13 +4594,7 @@ void App::onScroll(double xoff, double yoff) {
         double factor = (yoff > 0) ? 1.15 : 1.0 / 1.15;
         m_viewport.zoom *= factor;
         m_viewport.zoom = std::max(1.0, std::min(m_viewport.zoom, 2000.0));
-        if (m_liveLoopEnabled && !m_historicMode && !m_snapshotMode &&
-            !m_showAll && !m_mode3D && !m_crossSection) {
-            resetHistoricFrameCache(true);
-            scheduleInteractiveLiveLoopBackfill();
-        } else {
-            invalidateFrameCache(true);
-        }
+        noteInteractiveViewChange();
     }
 }
 
@@ -4595,13 +4612,7 @@ void App::onMouseDrag(double dx, double dy) {
     } else {
         m_viewport.center_lon -= dx / m_viewport.zoom;
         m_viewport.center_lat += dy / m_viewport.zoom;
-        if (m_liveLoopEnabled && !m_historicMode && !m_snapshotMode &&
-            !m_showAll && !m_mode3D && !m_crossSection) {
-            resetHistoricFrameCache(true);
-            scheduleInteractiveLiveLoopBackfill();
-        } else {
-            invalidateFrameCache(true);
-        }
+        noteInteractiveViewChange();
     }
 }
 
@@ -4638,7 +4649,7 @@ void App::onMouseMove(double mx, double my) {
 
     if (bestIdx != m_activeStationIdx && bestIdx >= 0) {
         m_activeStationIdx = bestIdx;
-        invalidateLiveLoop(false);
+        invalidateLiveLoop(false, true);
         bool needsUpload = false;
         bool enabled = false;
         {
@@ -4744,7 +4755,7 @@ void App::selectStation(int idx, bool centerView, double zoom) {
     m_autoTrackStation = false;
     if (stationChanged) {
         invalidatePanelCaches();
-        invalidateLiveLoop(false);
+        invalidateLiveLoop(false, true);
     }
 
     if (centerView) {
@@ -4810,16 +4821,7 @@ void App::setViewCenterZoom(double lat, double lon, double zoom) {
     m_viewport.center_lon = lon;
     if (zoom > 0.0)
         m_viewport.zoom = zoom;
-
-    if (m_liveLoopEnabled && !m_historicMode && !m_snapshotMode &&
-        !m_showAll && !m_mode3D && !m_crossSection) {
-        resetHistoricFrameCache(true);
-        scheduleInteractiveLiveLoopBackfill();
-    } else {
-        invalidateFrameCache(true);
-    }
-    m_needsComposite = true;
-    m_needsRerender = true;
+    noteInteractiveViewChange();
 }
 
 void App::setProduct(int p) {

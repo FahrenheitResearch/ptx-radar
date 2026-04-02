@@ -420,8 +420,9 @@ private:
     int panelRenderCount() const;
     int historicFrameCacheLimit() const;
     bool historicFrameCachingEnabled() const;
-    void invalidateLiveLoop(bool freeMemory = false);
+    void invalidateLiveLoop(bool freeMemory = false, bool preservePlayback = false);
     void requestLiveLoopCapture();
+    void noteInteractiveViewChange();
     void updateLiveLoop(float dt);
     void captureLiveLoopFrame(const uint32_t* d_src, int w, int h,
                               const std::string& label,
@@ -659,4 +660,5 @@ public:
     int m_liveLoopBackfillDeferFrames = 0;
     bool m_liveLoopInteractiveBackfill = false;
     std::atomic<bool> m_liveLoopLocalRefreshPending{false};
+    int m_liveLoopViewInteractionFrames = 0;
 };
