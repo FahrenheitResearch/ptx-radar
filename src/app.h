@@ -232,6 +232,7 @@ public:
     void onMouseMove(double mx, double my);
     void onResize(int w, int h);
     void onFramebufferResize(int w, int h);
+    void setViewCenterZoom(double lat, double lon, double zoom = -1.0);
 
     // Active station (nearest to mouse)
     int  activeStation() const { return m_activeStationIdx; }

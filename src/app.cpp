@@ -4805,6 +4805,23 @@ void App::onFramebufferResize(int w, int h) {
     updateMemoryTelemetry(true);
 }
 
+void App::setViewCenterZoom(double lat, double lon, double zoom) {
+    m_viewport.center_lat = lat;
+    m_viewport.center_lon = lon;
+    if (zoom > 0.0)
+        m_viewport.zoom = zoom;
+
+    if (m_liveLoopEnabled && !m_historicMode && !m_snapshotMode &&
+        !m_showAll && !m_mode3D && !m_crossSection) {
+        resetHistoricFrameCache(true);
+        scheduleInteractiveLiveLoopBackfill();
+    } else {
+        invalidateFrameCache(true);
+    }
+    m_needsComposite = true;
+    m_needsRerender = true;
+}
+
 void App::setProduct(int p) {
     if (p < 0 || p >= (int)Product::COUNT) return;
     if (p == m_activeProduct) return;

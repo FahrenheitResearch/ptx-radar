@@ -66,18 +66,17 @@ bool pointInWarning(float lat, float lon, const WarningPolygon& warning) {
 }
 
 void centerOnWarning(App& app, const WarningPolygon& warning) {
-    if (warning.lats.empty() || warning.lons.empty())
+    const size_t count = std::min(warning.lats.size(), warning.lons.size());
+    if (count < 3)
         return;
     double latSum = 0.0;
     double lonSum = 0.0;
-    const size_t count = std::min(warning.lats.size(), warning.lons.size());
     for (size_t i = 0; i < count; ++i) {
         latSum += warning.lats[i];
         lonSum += warning.lons[i];
     }
-    app.viewport().center_lat = latSum / (double)count;
-    app.viewport().center_lon = lonSum / (double)count;
-    app.viewport().zoom = std::max(app.viewport().zoom, 85.0);
+    app.setViewCenterZoom(latSum / (double)count, lonSum / (double)count,
+                          std::max(app.viewport().zoom, 85.0));
 }
 
 std::string stationLabelFromId(const std::vector<StationUiState>& stations, int stationId) {
@@ -149,9 +148,7 @@ void endFixedWindow() {
 }
 
 void resetConusView(App& app) {
-    app.viewport().center_lat = 39.0;
-    app.viewport().center_lon = -98.0;
-    app.viewport().zoom = 28.0;
+    app.setViewCenterZoom(39.0, -98.0, 28.0);
 }
 
 const char* performanceProfileLabel(PerformanceProfile profile) {
@@ -246,6 +243,88 @@ void drawPaneHeader(App& app, const ConsoleSession& session,
     draw->AddText(ImVec2(badgeTl.x + 8.0f, badgeTl.y + 38.0f), IM_COL32(132, 145, 165, 220), links);
 }
 
+void drawStationMarkers(App& app, const std::vector<StationUiState>& stations,
+                        ImDrawList* draw, const Viewport& vp, const ImVec2& origin) {
+    if (app.m_historicMode)
+        return;
+
+    const int activeIdx = app.activeStation();
+    for (int i = 0; i < (int)stations.size(); ++i) {
+        const auto& st = stations[i];
+        if (!app.showExperimentalSites() && NEXRAD_STATIONS[i].experimental)
+            continue;
+
+        const float px = origin.x + (float)((st.display_lon - vp.center_lon) * vp.zoom + vp.width * 0.5);
+        const float py = origin.y + (float)((vp.center_lat - st.display_lat) * vp.zoom + vp.height * 0.5);
+        if (px < origin.x - 50 || px > origin.x + vp.width + 50 ||
+            py < origin.y - 50 || py > origin.y + vp.height + 50) {
+            continue;
+        }
+
+        const bool isActive = (i == activeIdx);
+        const float boxW = 36.0f;
+        const float boxH = 14.0f;
+        ImU32 bgCol;
+        ImU32 borderCol;
+        ImU32 textCol;
+        if (!st.enabled) {
+            bgCol = isActive ? IM_COL32(95, 95, 105, 220) : IM_COL32(52, 52, 58, 170);
+            borderCol = isActive ? IM_COL32(185, 185, 195, 255) : IM_COL32(96, 96, 104, 190);
+            textCol = IM_COL32(185, 185, 195, 230);
+        } else {
+            bgCol = isActive ? IM_COL32(0, 180, 80, 220) : IM_COL32(40, 40, 50, 180);
+            borderCol = isActive ? IM_COL32(100, 255, 150, 255) : IM_COL32(80, 80, 100, 200);
+            textCol = isActive ? IM_COL32(255, 255, 255, 255) : IM_COL32(180, 180, 200, 220);
+        }
+
+        const ImVec2 tl(px - boxW * 0.5f, py - boxH * 0.5f);
+        const ImVec2 br(px + boxW * 0.5f, py + boxH * 0.5f);
+        draw->AddRectFilled(tl, br, bgCol, 3.0f);
+        draw->AddRect(tl, br, borderCol, 3.0f);
+        const char* label = st.icao.c_str();
+        const ImVec2 textSize = ImGui::CalcTextSize(label);
+        draw->AddText(ImVec2(px - textSize.x * 0.5f, py - textSize.y * 0.5f), textCol, label);
+    }
+}
+
+void drawWarningPolygons(App& app, const std::vector<WarningPolygon>& warnings,
+                         ImDrawList* draw, const Viewport& vp, const ImVec2& origin) {
+    if (!app.m_warningOptions.enabled || warnings.empty())
+        return;
+
+    for (const auto& warning : warnings) {
+        const size_t count = std::min(warning.lats.size(), warning.lons.size());
+        if (count < 3)
+            continue;
+
+        std::vector<ImVec2> pts;
+        pts.reserve(count);
+        bool anyOnScreen = false;
+        for (size_t i = 0; i < count; ++i) {
+            const float sx = origin.x + (float)((warning.lons[i] - vp.center_lon) * vp.zoom + vp.width * 0.5);
+            const float sy = origin.y + (float)((vp.center_lat - warning.lats[i]) * vp.zoom + vp.height * 0.5);
+            pts.push_back(ImVec2(sx, sy));
+            if (sx > origin.x - 100 && sx < origin.x + vp.width + 100 &&
+                sy > origin.y - 100 && sy < origin.y + vp.height + 100) {
+                anyOnScreen = true;
+            }
+        }
+        if (!anyOnScreen)
+            continue;
+
+        if (app.m_warningOptions.fillPolygons)
+            draw->AddConcavePolyFilled(pts.data(), (int)pts.size(),
+                                       app.m_warningOptions.resolvedFillColor(warning));
+        if (app.m_warningOptions.outlinePolygons) {
+            const uint32_t outlineCol = (warning.color & 0x00FFFFFFu) | 0xFF000000u;
+            for (int i = 0; i < (int)pts.size(); ++i) {
+                const int j = (i + 1) % (int)pts.size();
+                draw->AddLine(pts[i], pts[j], outlineCol, warning.line_width);
+            }
+        }
+    }
+}
+
 void drawCanvas(App& app, ConsoleSession& session, const ShellRegions& regions,
                 const ImGuiViewport* mainViewport,
                 const std::vector<StationUiState>& stations,
@@ -274,6 +353,8 @@ void drawCanvas(App& app, ConsoleSession& session, const ShellRegions& regions,
             app.basemap().drawBase(draw, paneVp, min);
             draw->AddImage((ImTextureID)(uintptr_t)app.panelTexture(pane).textureId(), min, max);
             app.basemap().drawOverlay(draw, paneVp, min);
+            drawWarningPolygons(app, warnings, draw, paneVp, min);
+            drawStationMarkers(app, stations, draw, paneVp, min);
             draw->AddRect(min, max, IM_COL32(35, 42, 56, 180), 0.0f, 0, 1.0f);
             drawPaneHeader(app, session, stations, draw, min, pane,
                            app.radarPanelProduct(pane), app.radarPanelTilt(pane),
@@ -281,10 +362,15 @@ void drawCanvas(App& app, ConsoleSession& session, const ShellRegions& regions,
             draw->PopClipRect();
         }
     } else {
+        Viewport paneVp = root;
+        paneVp.width = (int)rect.GetWidth();
+        paneVp.height = (int)rect.GetHeight();
         draw->PushClipRect(rect.Min, rect.Max, true);
-        app.basemap().drawBase(draw, root, rect.Min);
+        app.basemap().drawBase(draw, paneVp, rect.Min);
         draw->AddImage((ImTextureID)(uintptr_t)app.outputTexture().textureId(), rect.Min, rect.Max);
-        app.basemap().drawOverlay(draw, root, rect.Min);
+        app.basemap().drawOverlay(draw, paneVp, rect.Min);
+        drawWarningPolygons(app, warnings, draw, paneVp, rect.Min);
+        drawStationMarkers(app, stations, draw, paneVp, rect.Min);
         draw->AddRect(rect.Min, rect.Max, IM_COL32(35, 42, 56, 180), 0.0f, 0, 1.0f);
         drawPaneHeader(app, session, stations, draw, rect.Min, 0,
                        app.activeProduct(), app.activeTilt(), true);
@@ -522,7 +608,8 @@ void renderDock(App& app, ConsoleSession& session, const ShellRegions& regions,
             } else {
                 for (size_t i = 0; i < warnings.size(); ++i) {
                     const bool selected = warnings[i].id == session.alertFocus.selectedAlertId;
-                    if (ImGui::Selectable((warnings[i].event + "##alert_" + std::to_string(i)).c_str(), selected)) {
+                    const std::string alertLabel = warnings[i].event + "##alert_" + std::to_string(i);
+                    if (ImGui::Selectable(alertLabel.c_str(), selected)) {
                         selectAlert(app, session, warnings, stations, warnings[i].id);
                         centerOnWarning(app, warnings[i]);
                     }
@@ -540,8 +627,11 @@ void renderDock(App& app, ConsoleSession& session, const ShellRegions& regions,
                         }
                         if (!session.alertFocus.candidateStations.empty()) {
                             ImGui::SeparatorText("Candidate Stations");
-                            for (int stationId : session.alertFocus.candidateStations) {
-                                if (ImGui::Button(stationLabelFromId(stations, stationId).c_str(), ImVec2(88.0f, 0.0f))) {
+                            for (int candidateIdx = 0; candidateIdx < (int)session.alertFocus.candidateStations.size(); ++candidateIdx) {
+                                const int stationId = session.alertFocus.candidateStations[candidateIdx];
+                                const std::string stationButton =
+                                    stationLabelFromId(stations, stationId) + "##candidate_" + std::to_string(candidateIdx);
+                                if (ImGui::Button(stationButton.c_str(), ImVec2(88.0f, 0.0f))) {
                                     session.stationWorkflow.followNearest = false;
                                     session.stationWorkflow.lockedStationId = stationId;
                                     app.setAutoTrackStation(false);
