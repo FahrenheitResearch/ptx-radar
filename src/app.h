@@ -42,6 +42,17 @@ struct LiveVolumeHistoryEntry {
     float station_lon = 0.0f;
 };
 
+struct LiveChunkVolumeState {
+    int volume_id = -1;
+    std::string volume_key;
+    std::string latest_chunk_key;
+    std::vector<std::string> chunk_keys;
+    std::vector<uint8_t> assembled_bytes;
+    bool saw_start = false;
+    bool saw_end = false;
+    bool published_partial = false;
+};
+
 struct PipelineStageTimings {
     float decode_ms = 0.0f;
     float gpu_detect_build_ms = 0.0f;
@@ -83,6 +94,10 @@ struct StationState {
     Detection detection;
     PipelineStageTimings timings;
     std::deque<LiveVolumeHistoryEntry> live_history;
+    LiveChunkVolumeState live_chunk;
+    bool preview_partial = false;
+    int preview_sweep_count = 0;
+    int preview_radial_count = 0;
     int uploaded_product = -1;
     int uploaded_tilt = -1;
     int uploaded_sweep = -1;
@@ -109,6 +124,9 @@ struct StationUiState {
     int          lowest_radials = 0;
     Detection    detection;
     PipelineStageTimings timings;
+    bool         preview_partial = false;
+    int          preview_sweep_count = 0;
+    int          preview_radial_count = 0;
 };
 
 enum class PerformanceProfile {
@@ -407,10 +425,15 @@ private:
     void resetStationsForReload();
     void startDownloadsForTimestamp(int year, int month, int day, int hour, int minute);
     void queueLiveStationRefresh(int stationIdx, bool force = false);
+    void queuePublishedFileStationRefresh(int stationIdx, bool force = false);
+    void queueLiveChunkStationRefresh(int stationIdx, bool force = false);
     void finishLivePollNoChange(int stationIdx, uint64_t generation);
     bool tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t generation,
                             bool snapshotMode, bool lowestSweepOnly, bool dealiasEnabled,
                             const std::string& volumeKey);
+    bool tryProcessChunkProgress(int stationIdx, const std::vector<uint8_t>& assembledBytes,
+                                 uint64_t generation, bool dealiasEnabled,
+                                 const std::string& volumeKey, bool finalChunk);
     void updateLivePolling(std::chrono::steady_clock::time_point now);
     void updateMemoryTelemetry(bool force = false);
     void ensureRenderTargets();

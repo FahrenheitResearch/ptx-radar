@@ -369,6 +369,44 @@ void Level2Parser::parseMessages(const uint8_t* data, size_t size, ParsedRadarDa
     }
 }
 
+void Level2Parser::parseMessagesPreview(const uint8_t* data, size_t size,
+                                        ParsedRadarData& out,
+                                        float maxElevationDeg,
+                                        int minRadials) {
+    size_t pos = 0;
+
+    auto hasUsablePreview = [&](const ParsedRadarData& parsed) {
+        for (const auto& sweep : parsed.sweeps) {
+            if (sweep.elevation_angle > maxElevationDeg)
+                continue;
+            if ((int)sweep.radials.size() >= minRadials)
+                return true;
+        }
+        return false;
+    };
+
+    while (pos + sizeof(CtmHeader) + sizeof(MessageHeader) <= size) {
+        MessageHeader mh = {};
+        if (!readStruct(data, size, pos + sizeof(CtmHeader), mh)) break;
+
+        const uint8_t mtype = mh.messageType();
+        const uint16_t msize = mh.messageSize();
+
+        if (mtype == 31 && msize > 0 && msize < 30000) {
+            const size_t msgSize = (size_t)msize * 2;
+            const size_t msgDataOffset = pos + sizeof(CtmHeader) + sizeof(MessageHeader);
+            if (msgDataOffset < size) {
+                parseMsg31(data + msgDataOffset, std::min(msgSize, size - msgDataOffset), out);
+                if (hasUsablePreview(out))
+                    break;
+            }
+            pos += std::max(kRecordStride, msgSize + sizeof(CtmHeader));
+        } else {
+            pos += kRecordStride;
+        }
+    }
+}
+
 void Level2Parser::parseMsg31(const uint8_t* data, size_t size, ParsedRadarData& out) {
     Msg31Header hdr = {};
     if (!readStruct(data, size, 0, hdr)) return;
@@ -504,10 +542,11 @@ void Level2Parser::parseMsg31(const uint8_t* data, size_t size, ParsedRadarData&
     targetSweep->radials.push_back(std::move(radial));
 }
 
-void Level2Parser::organizeSweeps(ParsedRadarData& out) {
+void Level2Parser::organizeSweeps(ParsedRadarData& out, bool allowPartial) {
+    const size_t minSweepRadials = allowPartial ? 4 : 10;
     out.sweeps.erase(
         std::remove_if(out.sweeps.begin(), out.sweeps.end(),
-                       [](const ParsedSweep& s) { return s.radials.size() < 10; }),
+                       [minSweepRadials](const ParsedSweep& s) { return s.radials.size() < minSweepRadials; }),
         out.sweeps.end());
 
     for (auto& sweep : out.sweeps) {
@@ -550,6 +589,21 @@ ParsedRadarData Level2Parser::parseDecodedMessages(const std::vector<uint8_t>& d
 
     parseMessages(decodedBytes.data(), decodedBytes.size(), result);
     organizeSweeps(result);
+    return result;
+}
+
+ParsedRadarData Level2Parser::parseDecodedMessagesPreview(const std::vector<uint8_t>& decodedBytes,
+                                                          const std::string& stationId,
+                                                          float maxElevationDeg,
+                                                          int minRadials) {
+    ParsedRadarData result;
+    result.station_id = stationId;
+    if (decodedBytes.empty())
+        return result;
+
+    parseMessagesPreview(decodedBytes.data(), decodedBytes.size(), result,
+                         maxElevationDeg, std::max(8, minRadials));
+    organizeSweeps(result, true);
     return result;
 }
 

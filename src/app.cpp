@@ -29,6 +29,8 @@ using json = nlohmann::json;
 constexpr float kPi = 3.14159265f;
 constexpr float kDegToRad = kPi / 180.0f;
 constexpr float kInvalidSample = -9999.0f;
+constexpr int kChunkPreviewMinRadials = 96;
+constexpr float kChunkPreviewMinAzimuthSpanDeg = 90.0f;
 constexpr const char* kProbSevereHost = "mrms.ncep.noaa.gov";
 constexpr const char* kProbSevereIndexPath = "/ProbSevere/PROBSEVERE/";
 thread_local gpu_tensor::TensorWorkspace g_detectionTensorWorkspace;
@@ -64,6 +66,28 @@ std::string formatVolumeKeyTimestamp(const std::string& key) {
     }
 
     return filename;
+}
+
+std::string chunkVolumeDisplayKey(const StationInfo& station, int volumeId,
+                                  const std::vector<NexradChunkFile>& chunks) {
+    if (!chunks.empty())
+        return chunks.front().key;
+    char buffer[128];
+    std::snprintf(buffer, sizeof(buffer), "%s/%d/%s",
+                  stationFeedCode(station), volumeId, "chunk-volume");
+    return buffer;
+}
+
+bool isChunkStyleVolumeKey(const std::string& key, const std::string& stationCode) {
+    return !key.empty() &&
+           key.rfind(stationCode + "/", 0) == 0 &&
+           key.find('/', stationCode.size() + 1) != std::string::npos;
+}
+
+std::string liveListCursorKey(const std::string& currentKey, const std::string& stationCode) {
+    if (isChunkStyleVolumeKey(currentKey, stationCode))
+        return {};
+    return currentKey;
 }
 
 std::string formatEpochMsUtc(int64_t epochMs) {
@@ -104,6 +128,19 @@ int nearestRadialIndex(const PrecomputedSweep& sweep, float azimuthDeg, float* o
     if (outErrorDeg)
         *outErrorDeg = bestDelta;
     return bestIdx;
+}
+
+float parsedSweepAzimuthSpanDeg(const ParsedSweep& sweep) {
+    if (sweep.radials.size() < 2)
+        return 0.0f;
+
+    float largestGap = 0.0f;
+    for (size_t i = 1; i < sweep.radials.size(); ++i)
+        largestGap = std::max(largestGap, sweep.radials[i].azimuth - sweep.radials[i - 1].azimuth);
+
+    const float wrapGap = 360.0f - sweep.radials.back().azimuth + sweep.radials.front().azimuth;
+    largestGap = std::max(largestGap, wrapGap);
+    return std::clamp(360.0f - largestGap, 0.0f, 360.0f);
 }
 
 bool explicitTiltAllowed(const SweepFilter& filter, float elevationDeg) {
@@ -1988,6 +2025,10 @@ void App::setStationEnabled(int idx, bool enabled) {
             st.latestVolumeKey.clear();
             st.detection = {};
             st.live_history.clear();
+            st.live_chunk = {};
+            st.preview_partial = false;
+            st.preview_sweep_count = 0;
+            st.preview_radial_count = 0;
             st.uploaded_product = -1;
             st.uploaded_tilt = -1;
             st.uploaded_sweep = -1;
@@ -3431,6 +3472,10 @@ void App::failDownload(int stationIdx, uint64_t generation, std::string error) {
     }
     st.failed = true;
     st.error = std::move(error);
+    st.live_chunk = {};
+    st.preview_partial = false;
+    st.preview_sweep_count = 0;
+    st.preview_radial_count = 0;
     if (st.downloading) {
         st.downloading = false;
         m_stationsDownloading--;
@@ -3509,6 +3554,26 @@ void App::queueLiveStationRefresh(int stationIdx, bool force) {
         return;
 
     const StationInfo& stationInfo = NEXRAD_STATIONS[stationIdx];
+    const bool preferChunkFeed =
+        radarFeedSupportsChunkListing(stationInfo) &&
+        stationIdx == m_activeStationIdx &&
+        !m_showAll &&
+        !m_mode3D &&
+        !m_crossSection;
+
+    if (preferChunkFeed) {
+        queueLiveChunkStationRefresh(stationIdx, force);
+        return;
+    }
+
+    queuePublishedFileStationRefresh(stationIdx, force);
+}
+
+void App::queuePublishedFileStationRefresh(int stationIdx, bool force) {
+    if (stationIdx < 0 || stationIdx >= m_stationsTotal || m_snapshotMode || m_historicMode)
+        return;
+
+    const StationInfo& stationInfo = NEXRAD_STATIONS[stationIdx];
     const uint64_t generation = m_downloadGeneration.load();
     const bool dealiasEnabled = m_dealias;
     const auto now = std::chrono::steady_clock::now();
@@ -3535,7 +3600,7 @@ void App::queueLiveStationRefresh(int stationIdx, bool force) {
         st.error.clear();
         st.lastPollAttempt = now;
         station = st.icao;
-        currentKey = st.latestVolumeKey;
+        currentKey = liveListCursorKey(st.latestVolumeKey, station);
     }
     m_stationsDownloading++;
 
@@ -3627,6 +3692,280 @@ void App::queueLiveStationRefresh(int stationIdx, bool force) {
     );
 }
 
+bool App::tryProcessChunkProgress(int stationIdx, const std::vector<uint8_t>& assembledBytes,
+                                  uint64_t generation, bool dealiasEnabled,
+                                  const std::string& volumeKey, bool finalChunk) {
+    if (!isCurrentDownloadGeneration(generation) || assembledBytes.empty())
+        return false;
+
+    if (finalChunk) {
+        return tryProcessDownload(stationIdx, assembledBytes, generation,
+                                  false, false, dealiasEnabled, volumeKey);
+    }
+
+    const bool canPublishPartialRadialPreview =
+        !m_snapshotMode &&
+        !m_historicMode &&
+        stationIdx == m_activeStationIdx &&
+        !m_showAll &&
+        !m_mode3D &&
+        !m_crossSection &&
+        m_activeTilt == 0;
+    if (!canPublishPartialRadialPreview)
+        return false;
+
+    std::vector<uint8_t> decoded = Level2Parser::decodeArchiveBytes(assembledBytes);
+    if (decoded.empty())
+        return false;
+
+    const std::string stationName = NEXRAD_STATIONS[stationIdx].icao;
+    ParsedRadarData previewParsed =
+        Level2Parser::parseDecodedMessagesPreview(decoded, stationName, 1.5f, 32);
+    const int previewLowestIdx = findLowestParsedSweepIndex(previewParsed);
+    if (previewLowestIdx < 0 || previewLowestIdx >= (int)previewParsed.sweeps.size())
+        return false;
+
+    bool alreadyPublished = false;
+    {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        if (!isCurrentDownloadGeneration(generation))
+            return false;
+        if (stationIdx >= 0 && stationIdx < (int)m_stations.size())
+            alreadyPublished = m_stations[stationIdx].live_chunk.published_partial;
+    }
+
+    const ParsedSweep& previewSweep = previewParsed.sweeps[previewLowestIdx];
+    const float previewSpanDeg = parsedSweepAzimuthSpanDeg(previewSweep);
+    if (!alreadyPublished &&
+        ((int)previewSweep.radials.size() < kChunkPreviewMinRadials ||
+         previewSpanDeg < kChunkPreviewMinAzimuthSpanDeg)) {
+        return false;
+    }
+
+    std::vector<PrecomputedSweep> previewSweeps;
+    previewSweeps.push_back(buildPrecomputedSweep(previewSweep));
+    if (previewSweeps.empty())
+        return false;
+    if (dealiasEnabled)
+        dealiasPrecomputedSweeps(previewSweeps);
+    if (countProductSweeps(previewSweeps, m_activeProduct) <= 0)
+        return false;
+
+    {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        if (!isCurrentDownloadGeneration(generation))
+            return false;
+        auto& st = m_stations[stationIdx];
+        if (!st.enabled)
+            return false;
+        st.total_sweeps = std::max(1, (int)previewParsed.sweeps.size());
+        st.lowest_sweep_elev = previewSweeps.front().elevation_angle;
+        st.lowest_sweep_radials = previewSweeps.front().num_radials;
+        st.data_lat = previewParsed.station_lat != 0.0f ? previewParsed.station_lat : st.lat;
+        st.data_lon = previewParsed.station_lon != 0.0f ? previewParsed.station_lon : st.lon;
+        st.precomputed = std::move(previewSweeps);
+        st.full_volume_resident = false;
+        st.parsed = true;
+        st.failed = false;
+        st.error.clear();
+        st.preview_partial = true;
+        st.preview_sweep_count = 1;
+        st.preview_radial_count = st.precomputed.front().num_radials;
+        st.lastUpdate = std::chrono::steady_clock::now();
+        st.latestVolumeKey = volumeKey;
+        st.uploaded = false;
+        st.uploaded_product = -1;
+        st.uploaded_tilt = -1;
+        st.uploaded_sweep = -1;
+        st.uploaded_lowest_sweep = false;
+        st.live_chunk.published_partial = true;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_uploadMutex);
+        if (isCurrentDownloadGeneration(generation))
+            m_uploadQueue.push_back(stationIdx);
+    }
+    return true;
+}
+
+void App::queueLiveChunkStationRefresh(int stationIdx, bool force) {
+    if (stationIdx < 0 || stationIdx >= m_stationsTotal || m_snapshotMode || m_historicMode)
+        return;
+
+    const StationInfo& stationInfo = NEXRAD_STATIONS[stationIdx];
+    if (!radarFeedSupportsChunkListing(stationInfo)) {
+        queuePublishedFileStationRefresh(stationIdx, force);
+        return;
+    }
+
+    const uint64_t generation = m_downloadGeneration.load();
+    const bool dealiasEnabled = m_dealias;
+    const auto now = std::chrono::steady_clock::now();
+    std::string station;
+
+    {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        if (!isCurrentDownloadGeneration(generation)) return;
+        auto& st = m_stations[stationIdx];
+        if (!st.enabled) return;
+        if (st.downloading) return;
+
+        if (!force) {
+            const float elapsed = st.lastPollAttempt.time_since_epoch().count() == 0
+                ? std::numeric_limits<float>::max()
+                : std::chrono::duration<float>(now - st.lastPollAttempt).count();
+            if (elapsed < livePollIntervalSecForStation(stationIdx, st))
+                return;
+        }
+
+        st.downloading = true;
+        st.failed = false;
+        st.error.clear();
+        st.lastPollAttempt = now;
+        station = st.icao;
+    }
+    m_stationsDownloading++;
+
+    m_downloader->queueDownload(
+        station + "_chunk_volume_list",
+        NEXRAD_CHUNK_HOST,
+        buildChunkVolumePrefixListRequest(stationInfo),
+        [this, stationIdx, station, generation, dealiasEnabled](const std::string& id, DownloadResult listResult) {
+            (void)id;
+            auto fallbackToPublished = [this, stationIdx]() {
+                {
+                    std::lock_guard<std::mutex> lock(m_stationMutex);
+                    if (stationIdx >= 0 && stationIdx < (int)m_stations.size()) {
+                        auto& st = m_stations[stationIdx];
+                        if (st.downloading) {
+                            st.downloading = false;
+                            if (m_stationsDownloading.load() > 0)
+                                --m_stationsDownloading;
+                        }
+                    }
+                }
+                queuePublishedFileStationRefresh(stationIdx, true);
+            };
+
+            if (!isCurrentDownloadGeneration(generation)) return;
+            if (!listResult.success || listResult.data.empty()) {
+                fallbackToPublished();
+                return;
+            }
+
+            const StationInfo& site = NEXRAD_STATIONS[stationIdx];
+            const std::string stationCode = stationFeedCode(site);
+            std::vector<int> volumeIds =
+                parseS3CommonPrefixVolumeIds(std::string(listResult.data.begin(), listResult.data.end()),
+                                             stationCode);
+            if (volumeIds.empty()) {
+                fallbackToPublished();
+                return;
+            }
+
+            const int latestVolumeId = volumeIds.back();
+            auto chunkListResult = Downloader::httpGet(
+                NEXRAD_CHUNK_HOST, buildChunkListRequest(site, latestVolumeId));
+            if (!chunkListResult.success || chunkListResult.data.empty()) {
+                fallbackToPublished();
+                return;
+            }
+
+            std::vector<NexradChunkFile> chunks = parseChunkListResponse(chunkListResult.data);
+            if (chunks.empty()) {
+                fallbackToPublished();
+                return;
+            }
+
+            std::unordered_set<std::string> existingKeys;
+            existingKeys.reserve(chunks.size());
+
+            {
+                std::lock_guard<std::mutex> lock(m_stationMutex);
+                if (!isCurrentDownloadGeneration(generation)) return;
+                auto& st = m_stations[stationIdx];
+                if (!st.enabled) {
+                    if (st.downloading && m_stationsDownloading.load() > 0)
+                        --m_stationsDownloading;
+                    st.downloading = false;
+                    return;
+                }
+
+                if (st.live_chunk.volume_id != latestVolumeId) {
+                    st.live_chunk = {};
+                    st.live_chunk.volume_id = latestVolumeId;
+                    st.live_chunk.volume_key = chunkVolumeDisplayKey(site, latestVolumeId, chunks);
+                }
+
+                for (const auto& key : st.live_chunk.chunk_keys)
+                    existingKeys.insert(key);
+            }
+
+            std::vector<NexradChunkFile> missingChunks;
+            missingChunks.reserve(chunks.size());
+            for (const auto& chunk : chunks) {
+                if (existingKeys.find(chunk.key) == existingKeys.end())
+                    missingChunks.push_back(chunk);
+            }
+
+            if (missingChunks.empty()) {
+                finishLivePollNoChange(stationIdx, generation);
+                return;
+            }
+
+            bool processedAny = false;
+            bool finalProcessed = false;
+            std::string volumeKey = chunkVolumeDisplayKey(site, latestVolumeId, chunks);
+
+            for (const auto& chunk : missingChunks) {
+                if (!isCurrentDownloadGeneration(generation)) return;
+                auto chunkResult = Downloader::httpGet(
+                    NEXRAD_CHUNK_HOST, buildChunkDownloadRequest(chunk.key));
+                if (!chunkResult.success || chunkResult.data.empty())
+                    break;
+
+                std::vector<uint8_t> assembledSnapshot;
+                bool finalChunk = false;
+                {
+                    std::lock_guard<std::mutex> lock(m_stationMutex);
+                    if (!isCurrentDownloadGeneration(generation)) return;
+                    auto& st = m_stations[stationIdx];
+                    if (st.live_chunk.volume_id != latestVolumeId)
+                        return;
+                    st.live_chunk.chunk_keys.push_back(chunk.key);
+                    st.live_chunk.latest_chunk_key = chunk.key;
+                    st.live_chunk.saw_start = st.live_chunk.saw_start || chunk.part == 'S';
+                    st.live_chunk.saw_end = st.live_chunk.saw_end || chunk.part == 'E';
+                    if (st.live_chunk.volume_key.empty())
+                        st.live_chunk.volume_key = volumeKey;
+                    st.live_chunk.assembled_bytes.insert(st.live_chunk.assembled_bytes.end(),
+                                                         chunkResult.data.begin(), chunkResult.data.end());
+                    assembledSnapshot = st.live_chunk.assembled_bytes;
+                    finalChunk = st.live_chunk.saw_end;
+                    volumeKey = st.live_chunk.volume_key;
+                }
+
+                processedAny = tryProcessChunkProgress(stationIdx, assembledSnapshot, generation,
+                                                       dealiasEnabled, volumeKey, finalChunk) || processedAny;
+                if (finalChunk) {
+                    finalProcessed = true;
+                    break;
+                }
+            }
+
+            if (finalProcessed) {
+                std::lock_guard<std::mutex> lock(m_stationMutex);
+                if (!isCurrentDownloadGeneration(generation)) return;
+                auto& st = m_stations[stationIdx];
+                st.live_chunk = {};
+                return;
+            }
+
+            finishLivePollNoChange(stationIdx, generation);
+        });
+}
+
 void App::startDownloads() {
     int year, month, day;
     getUtcDate(year, month, day);
@@ -3677,6 +4016,10 @@ void App::resetStationsForReload() {
         st.latestVolumeKey.clear();
         st.detection = {};
         st.live_history.clear();
+        st.live_chunk = {};
+        st.preview_partial = false;
+        st.preview_sweep_count = 0;
+        st.preview_radial_count = 0;
         st.uploaded_product = -1;
         st.uploaded_tilt = -1;
         st.uploaded_sweep = -1;
@@ -3841,11 +4184,68 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
     float detectionLat = fallbackLat;
     float detectionLon = fallbackLon;
 
+    const bool canPublishPartialRadialPreview =
+        !snapshotMode &&
+        !m_historicMode &&
+        stationIdx == m_activeStationIdx &&
+        !m_showAll &&
+        !m_mode3D &&
+        !m_crossSection &&
+        m_activeTilt == 0;
+
+    if (canPublishPartialRadialPreview) {
+        auto previewParsed = Level2Parser::parseDecodedMessagesPreview(decoded, stationName, 1.5f, 64);
+        const int previewLowestIdx = findLowestParsedSweepIndex(previewParsed);
+        if (previewLowestIdx >= 0 && previewLowestIdx < (int)previewParsed.sweeps.size()) {
+            std::vector<PrecomputedSweep> previewSweeps;
+            previewSweeps.push_back(buildPrecomputedSweep(previewParsed.sweeps[previewLowestIdx]));
+            if (!previewSweeps.empty()) {
+                if (dealiasEnabled)
+                    dealiasPrecomputedSweeps(previewSweeps);
+
+                {
+                    std::lock_guard<std::mutex> lock(m_stationMutex);
+                    if (!isCurrentDownloadGeneration(generation)) return false;
+                    auto& st = m_stations[stationIdx];
+                    if (st.enabled && countProductSweeps(previewSweeps, m_activeProduct) > 0) {
+                        st.total_sweeps = std::max(1, (int)previewParsed.sweeps.size());
+                        st.lowest_sweep_elev = previewSweeps.front().elevation_angle;
+                        st.lowest_sweep_radials = previewSweeps.front().num_radials;
+                        st.data_lat = previewParsed.station_lat != 0.0f ? previewParsed.station_lat : detectionLat;
+                        st.data_lon = previewParsed.station_lon != 0.0f ? previewParsed.station_lon : detectionLon;
+                        st.precomputed = std::move(previewSweeps);
+                        st.full_volume_resident = false;
+                        st.parsed = true;
+                        st.failed = false;
+                        st.error.clear();
+                        st.preview_partial = true;
+                        st.preview_sweep_count = 1;
+                        st.preview_radial_count = st.precomputed.front().num_radials;
+                        st.lastUpdate = std::chrono::steady_clock::now();
+                        st.latestVolumeKey = volumeKey;
+                        st.uploaded = false;
+                        st.uploaded_product = -1;
+                        st.uploaded_tilt = -1;
+                        st.uploaded_sweep = -1;
+                        st.uploaded_lowest_sweep = false;
+                    }
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(m_uploadMutex);
+                    if (isCurrentDownloadGeneration(generation))
+                        m_uploadQueue.push_back(stationIdx);
+                }
+            }
+        }
+    }
+
     const GpuWorkingSetMode finalMode = preferFastLowestSweep
         ? GpuWorkingSetMode::LowestSweep
         : (keepFull ? GpuWorkingSetMode::AllSweeps : GpuWorkingSetMode::LowTilts);
     const bool runPreviewDetect = keepFull && !snapshotMode && !m_historicMode;
     FastGpuWorkingSet previewWorkingSet;
+    bool previewPublished = false;
     if (runPreviewDetect) {
         auto previewBuildStart = Clock::now();
         previewWorkingSet = buildGpuWorkingSetFromDecoded(decoded, GpuWorkingSetMode::LowTilts,
@@ -3874,6 +4274,61 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
                 st.detection = detection;
                 st.timings = timings;
             }
+
+            const bool canPublishPreview =
+                stationIdx == m_activeStationIdx &&
+                !m_showAll &&
+                !m_mode3D &&
+                !m_crossSection &&
+                m_activeTilt == 0 &&
+                countProductSweeps(previewWorkingSet.sweeps, m_activeProduct) > 0;
+            if (canPublishPreview) {
+                {
+                    std::lock_guard<std::mutex> lock(m_stationMutex);
+                    if (!isCurrentDownloadGeneration(generation)) return false;
+                    auto& st = m_stations[stationIdx];
+                    if (st.enabled) {
+                        st.total_sweeps = previewWorkingSet.total_sweeps > 0
+                            ? previewWorkingSet.total_sweeps
+                            : (int)previewWorkingSet.sweeps.size();
+                        st.lowest_sweep_elev = previewWorkingSet.sweeps.empty()
+                            ? 0.0f
+                            : previewWorkingSet.sweeps.front().elevation_angle;
+                        st.lowest_sweep_radials = previewWorkingSet.sweeps.empty()
+                            ? 0
+                            : previewWorkingSet.sweeps.front().num_radials;
+                        st.data_lat = detectionLat;
+                        st.data_lon = detectionLon;
+                        st.precomputed = previewWorkingSet.sweeps;
+                        st.full_volume_resident = false;
+                        st.parsed = true;
+                        st.failed = false;
+                        st.error.clear();
+                        st.timings = timings;
+                        if (haveDetection)
+                            st.detection = detection;
+                        st.preview_partial = true;
+                        st.preview_sweep_count = (int)previewWorkingSet.sweeps.size();
+                        st.preview_radial_count = previewWorkingSet.sweeps.empty()
+                            ? 0
+                            : previewWorkingSet.sweeps.front().num_radials;
+                        st.lastUpdate = std::chrono::steady_clock::now();
+                        st.latestVolumeKey = volumeKey;
+                        st.uploaded = false;
+                        st.uploaded_product = -1;
+                        st.uploaded_tilt = -1;
+                        st.uploaded_sweep = -1;
+                        st.uploaded_lowest_sweep = false;
+                        previewPublished = true;
+                    }
+                }
+
+                if (previewPublished) {
+                    std::lock_guard<std::mutex> lock(m_uploadMutex);
+                    if (isCurrentDownloadGeneration(generation))
+                        m_uploadQueue.push_back(stationIdx);
+                }
+            }
         }
     }
 
@@ -3898,7 +4353,7 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
         parsed = Level2Parser::parseDecodedMessages(decoded, stationName);
         timings.parse_ms = elapsedMs(parseStart, Clock::now());
         if (parsed.sweeps.empty())
-            return false;
+            return previewPublished;
 
         detectionLat = parsed.station_lat != 0.0f ? parsed.station_lat : fallbackLat;
         detectionLon = parsed.station_lon != 0.0f ? parsed.station_lon : fallbackLon;
@@ -3965,6 +4420,9 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
         st.error.clear();
         st.detection = std::move(detection);
         st.timings = timings;
+        st.preview_partial = false;
+        st.preview_sweep_count = 0;
+        st.preview_radial_count = 0;
         if (!snapshotMode && !m_historicMode)
             appendLiveHistoryLocked(st, volumeKey, st.precomputed, detectionLat, detectionLon);
         if (st.downloading) {
@@ -4113,6 +4571,9 @@ std::vector<StationUiState> App::stations() const {
         ui.lowest_radials = st.lowest_sweep_radials;
         ui.detection = st.detection;
         ui.timings = st.timings;
+        ui.preview_partial = st.preview_partial;
+        ui.preview_sweep_count = st.preview_sweep_count;
+        ui.preview_radial_count = st.preview_radial_count;
         snapshot.push_back(std::move(ui));
     }
     return snapshot;

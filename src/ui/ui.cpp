@@ -741,6 +741,13 @@ void renderDock(App& app, ConsoleSession& session, const ShellRegions& regions,
                 const auto& st = stations[session.stationWorkflow.focusedStationId];
                 if (!st.latest_scan_utc.empty())
                     ImGui::Text("Latest scan: %s", st.latest_scan_utc.c_str());
+                if (st.preview_partial) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.46f, 1.0f),
+                                       "Partial live preview: %d radials in %d sweep%s",
+                                       st.preview_radial_count,
+                                       st.preview_sweep_count,
+                                       st.preview_sweep_count == 1 ? "" : "s");
+                }
             }
     } else if (session.activeDockTab == ContextDockTab::Alerts) {
             ImGui::Checkbox("Overlays", &app.m_warningOptions.enabled);

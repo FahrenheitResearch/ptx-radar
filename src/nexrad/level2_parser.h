@@ -17,6 +17,12 @@ public:
     static ParsedRadarData parseDecodedMessages(const std::vector<uint8_t>& decodedBytes,
                                                 const std::string& stationId = {});
 
+    // Parse only enough decoded messages to build a provisional lowest-cut preview.
+    static ParsedRadarData parseDecodedMessagesPreview(const std::vector<uint8_t>& decodedBytes,
+                                                       const std::string& stationId = {},
+                                                       float maxElevationDeg = 1.5f,
+                                                       int minRadials = 64);
+
     // Parse raw file bytes into structured radar data.
     // Returns empty data on failure.
     static ParsedRadarData parse(const std::vector<uint8_t>& fileData);
@@ -35,11 +41,15 @@ private:
     // Parse decompressed messages into radials
     static void parseMessages(const uint8_t* data, size_t size,
                               ParsedRadarData& out);
+    static void parseMessagesPreview(const uint8_t* data, size_t size,
+                                     ParsedRadarData& out,
+                                     float maxElevationDeg,
+                                     int minRadials);
 
     // Parse a single Message Type 31
     static void parseMsg31(const uint8_t* data, size_t size,
                            ParsedRadarData& out);
 
     // Organize parsed radials into sweeps
-    static void organizeSweeps(ParsedRadarData& out);
+    static void organizeSweeps(ParsedRadarData& out, bool allowPartial = false);
 };

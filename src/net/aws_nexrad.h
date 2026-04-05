@@ -10,12 +10,23 @@
 // AWS S3 NEXRAD Level 2 bucket
 constexpr const char* NEXRAD_BUCKET = "unidata-nexrad-level2";
 constexpr const char* NEXRAD_HOST = "unidata-nexrad-level2.s3.amazonaws.com";
+constexpr const char* NEXRAD_CHUNK_BUCKET = "unidata-nexrad-level2-chunks";
+constexpr const char* NEXRAD_CHUNK_HOST = "unidata-nexrad-level2-chunks.s3.amazonaws.com";
 constexpr const char* IEM_LEVEL2_HOST = "mesonet-nexrad.agron.iastate.edu";
 
 struct NexradFile {
     std::string key;
     std::string url;
     size_t      size;
+};
+
+struct NexradChunkFile {
+    std::string key;
+    std::string url;
+    size_t size = 0;
+    int volume_id = -1;
+    int sequence = -1;
+    char part = '?'; // S=start, I=intermediate, E=end
 };
 
 inline const char* stationFeedCode(const StationInfo& station) {
@@ -34,6 +45,10 @@ inline const char* radarDataHost(const StationInfo& station) {
 }
 
 inline bool radarFeedUsesDatePartitionedListing(const StationInfo& station) {
+    return station.feed == RadarFeedKind::AwsS3DatePartitioned;
+}
+
+inline bool radarFeedSupportsChunkListing(const StationInfo& station) {
     return station.feed == RadarFeedKind::AwsS3DatePartitioned;
 }
 
@@ -80,6 +95,28 @@ inline std::string buildRadarDownloadRequest(const StationInfo& station,
         default:
             return "/" + key;
     }
+}
+
+inline std::string buildChunkVolumePrefixListRequest(const StationInfo& station) {
+    return "/?list-type=2&prefix=" + std::string(stationFeedCode(station)) +
+           "/&delimiter=/&max-keys=1000";
+}
+
+inline std::string buildChunkListRequest(const StationInfo& station,
+                                         int volumeId,
+                                         const std::string& startAfterKey = {}) {
+    std::string prefix =
+        std::string(stationFeedCode(station)) + "/" + std::to_string(volumeId) + "/";
+    std::string query = "/?list-type=2&prefix=" + prefix;
+    if (!startAfterKey.empty())
+        query += "&start-after=" + startAfterKey;
+    else
+        query += "&max-keys=1000";
+    return query;
+}
+
+inline std::string buildChunkDownloadRequest(const std::string& key) {
+    return "/" + key;
 }
 
 // Get current UTC date
@@ -179,6 +216,129 @@ inline std::vector<NexradFile> parseS3ListResponse(const std::string& xml) {
               });
 
     return files;
+}
+
+inline std::vector<int> parseS3CommonPrefixVolumeIds(const std::string& xml,
+                                                     const std::string& station) {
+    std::vector<int> ids;
+    const std::string prefixTag = "<Prefix>";
+    const std::string suffix = station + "/";
+
+    size_t pos = 0;
+    while (true) {
+        size_t start = xml.find(prefixTag, pos);
+        if (start == std::string::npos) break;
+        start += prefixTag.size();
+        size_t end = xml.find("</Prefix>", start);
+        if (end == std::string::npos) break;
+        std::string prefix = xml.substr(start, end - start);
+        pos = end + 9;
+
+        if (prefix.rfind(suffix, 0) != 0)
+            continue;
+        std::string rest = prefix.substr(suffix.size());
+        if (!rest.empty() && rest.back() == '/')
+            rest.pop_back();
+        if (rest.empty())
+            continue;
+
+        bool digitsOnly = true;
+        for (char c : rest) {
+            if (!std::isdigit((unsigned char)c)) {
+                digitsOnly = false;
+                break;
+            }
+        }
+        if (!digitsOnly)
+            continue;
+
+        ids.push_back(std::stoi(rest));
+    }
+
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    return ids;
+}
+
+inline bool parseChunkKey(const std::string& key, NexradChunkFile& out) {
+    const size_t firstSlash = key.find('/');
+    if (firstSlash == std::string::npos) return false;
+    const size_t secondSlash = key.find('/', firstSlash + 1);
+    if (secondSlash == std::string::npos) return false;
+
+    const std::string volumeText = key.substr(firstSlash + 1, secondSlash - firstSlash - 1);
+    if (volumeText.empty()) return false;
+    for (char c : volumeText) {
+        if (!std::isdigit((unsigned char)c))
+            return false;
+    }
+
+    const std::string filename = key.substr(secondSlash + 1);
+    const size_t dash2 = filename.rfind('-');
+    if (dash2 == std::string::npos || dash2 + 1 >= filename.size())
+        return false;
+    const size_t dash1 = filename.rfind('-', dash2 - 1);
+    if (dash1 == std::string::npos || dash1 + 1 >= dash2)
+        return false;
+
+    const std::string seqText = filename.substr(dash1 + 1, dash2 - dash1 - 1);
+    bool seqDigits = !seqText.empty();
+    for (char c : seqText) {
+        if (!std::isdigit((unsigned char)c)) {
+            seqDigits = false;
+            break;
+        }
+    }
+    if (!seqDigits)
+        return false;
+
+    out.key = key;
+    out.url = buildChunkDownloadRequest(key);
+    out.volume_id = std::stoi(volumeText);
+    out.sequence = std::stoi(seqText);
+    out.part = filename[dash2 + 1];
+    return true;
+}
+
+inline std::vector<NexradChunkFile> parseChunkListResponse(const std::vector<uint8_t>& payload) {
+    std::vector<NexradChunkFile> chunks;
+    const std::string xml(payload.begin(), payload.end());
+
+    size_t pos = 0;
+    while (true) {
+        size_t keyStart = xml.find("<Key>", pos);
+        if (keyStart == std::string::npos) break;
+        keyStart += 5;
+
+        size_t keyEnd = xml.find("</Key>", keyStart);
+        if (keyEnd == std::string::npos) break;
+
+        std::string key = xml.substr(keyStart, keyEnd - keyStart);
+        pos = keyEnd + 6;
+
+        size_t sizeVal = 0;
+        size_t sizeStart = xml.find("<Size>", pos);
+        if (sizeStart != std::string::npos && sizeStart < xml.find("<Key>", pos)) {
+            sizeStart += 6;
+            size_t sizeEnd = xml.find("</Size>", sizeStart);
+            if (sizeEnd != std::string::npos)
+                sizeVal = std::stoull(xml.substr(sizeStart, sizeEnd - sizeStart));
+        }
+
+        NexradChunkFile chunk;
+        if (!parseChunkKey(key, chunk))
+            continue;
+        chunk.size = sizeVal;
+        chunks.push_back(std::move(chunk));
+    }
+
+    std::sort(chunks.begin(), chunks.end(),
+              [](const NexradChunkFile& a, const NexradChunkFile& b) {
+                  if (a.volume_id != b.volume_id) return a.volume_id < b.volume_id;
+                  if (a.sequence != b.sequence) return a.sequence < b.sequence;
+                  return a.key < b.key;
+              });
+    return chunks;
 }
 
 inline std::vector<NexradFile> parseIemDirListResponse(const StationInfo& station,
