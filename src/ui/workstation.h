@@ -23,6 +23,8 @@ enum class WorkspaceId {
 enum class ContextDockTab {
     Inspect = 0,
     Alerts,
+    Archive,
+    Tools,
     Layers,
     Assets,
     Session
@@ -156,6 +158,7 @@ struct ConsoleSession {
     ContextDockTab activeDockTab = ContextDockTab::Inspect;
     bool contextDockOpen = true;
     bool workspaceRailExpanded = false;
+    float workspaceRailWidth = 100.0f;
     int activePaneIndex = 0;
     StationWorkflowState stationWorkflow;
     TransportState transport;

@@ -33,6 +33,12 @@ constexpr size_t kMaxDecompressedBlockBytes = 256u * 1024u * 1024u;
 constexpr size_t kMaxCombinedBytes = 512u * 1024u * 1024u;
 constexpr int kMaxMsg31Blocks = 32;
 
+int64_t mjdAndMillisecondsToEpochMs(uint32_t mjd, uint32_t milliseconds) {
+    constexpr int64_t kUnixEpochMjd = 40587;
+    constexpr int64_t kMsPerDay = 86400000LL;
+    return ((int64_t)mjd - kUnixEpochMjd) * kMsPerDay + (int64_t)milliseconds;
+}
+
 struct BlockDesc {
     size_t offset = 0;
     size_t size = 0;
@@ -376,6 +382,10 @@ void Level2Parser::parseMsg31(const uint8_t* data, size_t size, ParsedRadarData&
     radial.azimuth = hdr.azimuth();
     radial.elevation = hdr.elevation();
     radial.radial_status = hdr.radial_status;
+    radial.collection_epoch_ms =
+        mjdAndMillisecondsToEpochMs((uint32_t)bswap16(hdr.collection_date_be),
+                                    bswap32(hdr.collection_time_be));
+    radial.azimuth_number = hdr.azimuthNumber();
 
     if (!std::isfinite(radial.azimuth) || !std::isfinite(radial.elevation)) return;
     if (radial.azimuth < 0.0f || radial.azimuth >= 360.0f) return;

@@ -245,6 +245,8 @@ const char* contextDockTabLabel(ContextDockTab tab) {
     switch (tab) {
         case ContextDockTab::Inspect: return "Inspect";
         case ContextDockTab::Alerts: return "Alerts";
+        case ContextDockTab::Archive: return "Archive";
+        case ContextDockTab::Tools: return "Tools";
         case ContextDockTab::Layers: return "Layers";
         case ContextDockTab::Assets: return "Assets";
         case ContextDockTab::Session: return "Session";

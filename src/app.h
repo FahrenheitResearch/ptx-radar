@@ -305,7 +305,7 @@ public:
     const std::string& colorTableLabel(int product) const { return m_colorTableLabels[product]; }
     bool            liveLoopEnabled() const { return m_liveLoopEnabled; }
     void            setLiveLoopEnabled(bool enabled);
-    bool            liveLoopPlaying() const { return m_liveLoopPlaying; }
+    bool            liveLoopPlaying() const { return m_liveLoopPlayIntent; }
     void            toggleLiveLoopPlayback();
     int             liveLoopLength() const { return m_liveLoopLength; }
     void            setLiveLoopLength(int frames);
@@ -368,6 +368,15 @@ public:
                           int year, int month, int day,
                           int startHour, int startMin,
                           int endHour, int endMin);
+    ArchiveProjectionKind archiveProjectionKind() const { return m_archiveProjectionKind; }
+    void            setArchiveProjectionKind(ArchiveProjectionKind kind);
+    const InterrogationPoint& archiveInterrogationPoint() const { return m_archiveInterrogationPoint; }
+    void            setArchiveInterrogationPoint(float lat, float lon);
+    bool            archiveSweepPointPickArmed() const { return m_archiveSweepPointPickArmed; }
+    void            armArchiveSweepPointPick(bool armed) { m_archiveSweepPointPickArmed = armed; }
+    const SweepFilter& archiveSweepFilter() const { return m_archiveSweepFilter; }
+    void            setArchiveSweepFilter(const SweepFilter& filter);
+    const SweepTimeline& archiveSweepTimeline() const { return m_archiveSweepTimeline; }
     bool snapshotMode() const { return m_snapshotMode; }
     const char* snapshotLabel() const { return m_snapshotLabel.c_str(); }
     bool snapshotLowestSweepOnly() const { return m_snapshotLowestSweepOnly; }
@@ -461,6 +470,12 @@ private:
     bool ensurePanelCacheUpload(int paneIndex, int product, int tilt,
                                 float* outElevationAngle = nullptr);
     void invalidatePanelCaches();
+    void rebuildArchiveSweepTimeline();
+    std::string archiveCurrentLabel() const;
+    bool archiveSweepStreamActive() const;
+    const RadarFrame* archiveFrameForTransportCursor(int* outSweepIndex = nullptr) const;
+    int archiveFrameCount() const;
+    void updateArchiveSweepPlayback(float dt);
 
     Viewport         m_viewport;
     int              m_activeProduct = 0;
@@ -580,6 +595,15 @@ public:
     HistoricLoader m_historic;
     bool m_historicMode = false;
     int  m_lastHistoricFrame = -1;
+    ArchiveProjectionKind m_archiveProjectionKind = ArchiveProjectionKind::VolumeTimeline;
+    InterrogationPoint m_archiveInterrogationPoint;
+    SweepFilter m_archiveSweepFilter;
+    SweepTimeline m_archiveSweepTimeline;
+    int m_archiveSweepCursor = 0;
+    int m_archiveSweepLastSourceCount = -1;
+    bool m_archiveSweepPlaying = false;
+    float m_archiveSweepAccumulator = 0.0f;
+    bool m_archiveSweepPointPickArmed = false;
     void loadHistoricEvent(int idx);
     void uploadHistoricFrame(int frameIdx);
 
@@ -637,6 +661,7 @@ public:
     static constexpr int MAX_LIVE_LOOP_FRAMES = 500;
     bool m_liveLoopEnabled = false;
     bool m_liveLoopPlaying = false;
+    bool m_liveLoopPlayIntent = false;
     int m_liveLoopLength = 8;
     int m_liveLoopCount = 0;
     int m_liveLoopWriteIndex = 0;

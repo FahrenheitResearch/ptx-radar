@@ -6,6 +6,7 @@
 #endif
 
 constexpr double EARTH_RADIUS_KM = 6371.0;
+constexpr double EFFECTIVE_EARTH_RADIUS_KM = EARTH_RADIUS_KM * (4.0 / 3.0);
 constexpr double DEG_TO_RAD = M_PI / 180.0;
 constexpr double RAD_TO_DEG = 180.0 / M_PI;
 constexpr double NEXRAD_MAX_RANGE_KM = 460.0;
@@ -58,6 +59,13 @@ inline double azimuthDeg(double lat1, double lon1, double lat2, double lon2) {
     double x = cos(la1) * sin(la2) - sin(la1) * cos(la2) * cos(dlon);
     double az = atan2(y, x) * RAD_TO_DEG;
     return fmod(az + 360.0, 360.0);
+}
+
+inline double beamHeightAboveRadarMeters(double range_km, double elevation_deg) {
+    const double re_m = EFFECTIVE_EARTH_RADIUS_KM * 1000.0;
+    const double r_m = range_km * 1000.0;
+    const double elev_rad = elevation_deg * DEG_TO_RAD;
+    return std::sqrt(r_m * r_m + re_m * re_m + 2.0 * r_m * re_m * std::sin(elev_rad)) - re_m;
 }
 
 // Offset a lat/lon by km in N/E directions (flat earth approx, good for <500km)

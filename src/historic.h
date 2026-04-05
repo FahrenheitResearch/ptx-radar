@@ -12,13 +12,65 @@
 
 // A single radar frame (one volume scan at one time)
 struct RadarFrame {
+    std::string volume_key;
     std::string filename;
     std::string timestamp; // extracted from filename
     std::string valid_time_iso;
     int64_t valid_time_epoch = 0;
+    int64_t volume_start_epoch_ms = 0;
+    int64_t volume_end_epoch_ms = 0;
+    uint16_t station_height_m = 0;
     std::vector<PrecomputedSweep> sweeps; // precomputed GPU-ready data (from app.h)
     float station_lat = 0, station_lon = 0;
     bool ready = false;
+};
+
+enum class ArchiveProjectionKind {
+    VolumeTimeline = 0,
+    SweepStream
+};
+
+enum class SweepStreamStyle {
+    Dense = 0,
+    Smooth,
+    StrictSmooth
+};
+
+struct InterrogationPoint {
+    bool valid = false;
+    float lat = 0.0f;
+    float lon = 0.0f;
+};
+
+struct SweepFilter {
+    bool sub_1p5_only = false;
+    bool require_active_product = false;
+    bool require_point_coverage = true;
+    float max_beam_height_arl_m = -1.0f;
+    float max_elevation_deg = -1.0f;
+    SweepStreamStyle style = SweepStreamStyle::Smooth;
+    std::vector<float> explicit_tilt_set_deg;
+};
+
+struct SweepFrameRef {
+    int volume_frame_index = -1;
+    int sweep_index = -1;
+    int64_t point_sample_epoch_ms = 0;
+    float elevation_deg = 0.0f;
+    float ground_range_km = 0.0f;
+    float point_azimuth_deg = 0.0f;
+    float beam_height_arl_m = 0.0f;
+    uint32_t point_product_mask = 0;
+    float azimuth_error_deg = 0.0f;
+    std::string label;
+};
+
+struct SweepTimeline {
+    InterrogationPoint point;
+    SweepFilter filter;
+    std::vector<SweepFrameRef> frames;
+    int candidate_frames = 0;
+    bool complete = false;
 };
 
 // Preset historic tornado events

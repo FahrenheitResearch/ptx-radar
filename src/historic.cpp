@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cmath>
 #include <ctime>
+#include <limits>
 #include <memory>
 
 // ── Download and parse all frames for a historic event ──────
@@ -54,13 +55,62 @@ bool inHistoricWindow(const HistoricEvent& ev, int hh, int mm) {
 }
 
 void populateSweepData(const ParsedSweep& sweep, PrecomputedSweep& pc) {
+    pc.meta.sweep_number = sweep.sweep_number;
     pc.elevation_angle = sweep.elevation_angle;
     pc.num_radials = (int)sweep.radials.size();
     if (pc.num_radials <= 0) return;
 
+    pc.meta.radial_count = (uint16_t)std::min(pc.num_radials, 0xFFFF);
+    pc.meta.timing_exact = true;
+    bool sawSweepStart = false;
+    bool sawSweepEnd = false;
+    int64_t minEpoch = std::numeric_limits<int64_t>::max();
+    int64_t maxEpoch = std::numeric_limits<int64_t>::min();
     pc.azimuths.resize(pc.num_radials);
+    pc.radial_time_offset_ms.resize(pc.num_radials);
     for (int r = 0; r < pc.num_radials; r++)
         pc.azimuths[r] = sweep.radials[r].azimuth;
+
+    if (!sweep.radials.empty()) {
+        pc.meta.first_azimuth_number = sweep.radials.front().azimuth_number;
+        pc.meta.last_azimuth_number = sweep.radials.back().azimuth_number;
+    }
+
+    for (const auto& radial : sweep.radials) {
+        if (radial.collection_epoch_ms <= 0) {
+            pc.meta.timing_exact = false;
+        } else {
+            minEpoch = std::min(minEpoch, radial.collection_epoch_ms);
+            maxEpoch = std::max(maxEpoch, radial.collection_epoch_ms);
+        }
+
+        switch (radial.radial_status) {
+            case 0:
+            case 3:
+                sawSweepStart = true;
+                break;
+            case 2:
+            case 4:
+                sawSweepEnd = true;
+                break;
+            default:
+                break;
+        }
+    }
+
+    if (minEpoch != std::numeric_limits<int64_t>::max() &&
+        maxEpoch != std::numeric_limits<int64_t>::min()) {
+        pc.meta.sweep_start_epoch_ms = minEpoch;
+        pc.meta.sweep_end_epoch_ms = maxEpoch;
+        pc.meta.sweep_display_epoch_ms = minEpoch + (maxEpoch - minEpoch) / 2;
+        for (int r = 0; r < pc.num_radials; ++r) {
+            const int64_t delta = sweep.radials[r].collection_epoch_ms - minEpoch;
+            pc.radial_time_offset_ms[r] = (uint32_t)std::max<int64_t>(0, delta);
+        }
+    } else {
+        pc.radial_time_offset_ms.assign(pc.num_radials, 0);
+    }
+    pc.meta.boundary_complete = sawSweepStart && sawSweepEnd;
 
     for (const auto& radial : sweep.radials) {
         for (const auto& moment : radial.moments) {
@@ -74,6 +124,7 @@ void populateSweepData(const ParsedSweep& sweep, PrecomputedSweep& pc) {
                 pd.gate_spacing_km = moment.gate_spacing_m / 1000.0f;
                 pd.scale = moment.scale;
                 pd.offset = moment.offset;
+                pc.meta.product_mask |= (1u << p);
             }
         }
     }
@@ -100,9 +151,11 @@ void populateSweepData(const ParsedSweep& sweep, PrecomputedSweep& pc) {
 
 std::shared_ptr<RadarFrame> buildFrame(const ParsedRadarData& parsed, const std::string& key) {
     auto frame = std::make_shared<RadarFrame>();
+    frame->volume_key = key;
     frame->filename = filenameFromKey(key);
     frame->station_lat = parsed.station_lat;
     frame->station_lon = parsed.station_lon;
+    frame->station_height_m = parsed.station_height_m;
 
     int year = 0, month = 0, day = 0;
     int hh = 0, mm = 0, ss = 0;
@@ -121,6 +174,21 @@ std::shared_ptr<RadarFrame> buildFrame(const ParsedRadarData& parsed, const std:
     frame->sweeps.resize(parsed.sweeps.size());
     for (int si = 0; si < (int)parsed.sweeps.size(); si++)
         populateSweepData(parsed.sweeps[si], frame->sweeps[si]);
+
+    if (!frame->sweeps.empty()) {
+        int64_t minSweepEpoch = std::numeric_limits<int64_t>::max();
+        int64_t maxSweepEpoch = std::numeric_limits<int64_t>::min();
+        for (const auto& sweep : frame->sweeps) {
+            if (sweep.meta.sweep_start_epoch_ms > 0)
+                minSweepEpoch = std::min(minSweepEpoch, sweep.meta.sweep_start_epoch_ms);
+            if (sweep.meta.sweep_end_epoch_ms > 0)
+                maxSweepEpoch = std::max(maxSweepEpoch, sweep.meta.sweep_end_epoch_ms);
+        }
+        if (minSweepEpoch != std::numeric_limits<int64_t>::max())
+            frame->volume_start_epoch_ms = minSweepEpoch;
+        if (maxSweepEpoch != std::numeric_limits<int64_t>::min())
+            frame->volume_end_epoch_ms = maxSweepEpoch;
+    }
 
     frame->ready = true;
     return frame;

@@ -95,10 +95,9 @@ struct ShellRegions {
     ImRect timeDeck;
 };
 
-ShellRegions computeRegions(const ImGuiViewport* viewport, bool dockOpen) {
+ShellRegions computeRegions(const ImGuiViewport* viewport, bool dockOpen, float leftWidth) {
     constexpr float pad = 12.0f;
     constexpr float topH = 70.0f;
-    constexpr float leftW = 88.0f;
     constexpr float rightW = 356.0f;
     constexpr float bottomH = 116.0f;
     constexpr float gap = 10.0f;
@@ -113,11 +112,12 @@ ShellRegions computeRegions(const ImGuiViewport* viewport, bool dockOpen) {
     const float bodyTop = r.topBar.Max.y + gap;
     const float bodyBottom = pos.y + size.y - pad - bottomH - gap;
     const float rightWidth = dockOpen ? rightW : 0.0f;
-    const float centerLeft = pos.x + pad + leftW + gap;
+    const float railWidth = std::clamp(leftWidth, 100.0f, 220.0f);
+    const float centerLeft = pos.x + pad + railWidth + gap;
     const float centerRight = pos.x + size.x - pad - rightWidth - (dockOpen ? gap : 0.0f);
 
     r.leftRail = ImRect(ImVec2(pos.x + pad, bodyTop),
-                        ImVec2(pos.x + pad + leftW, bodyBottom));
+                        ImVec2(pos.x + pad + railWidth, bodyBottom));
     r.centerCanvas = ImRect(ImVec2(centerLeft, bodyTop),
                             ImVec2(centerRight, bodyBottom));
     r.rightDock = ImRect(ImVec2(pos.x + size.x - pad - rightWidth, bodyTop),
@@ -125,6 +125,30 @@ ShellRegions computeRegions(const ImGuiViewport* viewport, bool dockOpen) {
     r.timeDeck = ImRect(ImVec2(centerLeft, pos.y + size.y - pad - bottomH),
                         ImVec2(pos.x + size.x - pad, pos.y + size.y - pad));
     return r;
+}
+
+void handleRailResize(ConsoleSession& session, const ShellRegions& regions) {
+    const float splitterW = 8.0f;
+    const ImVec2 pos(regions.leftRail.Max.x - splitterW * 0.5f, regions.leftRail.Min.y);
+    const ImVec2 size(splitterW, regions.leftRail.GetHeight());
+    ImGui::SetNextWindowPos(pos, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoDocking |
+                             ImGuiWindowFlags_NoResize |
+                             ImGuiWindowFlags_NoMove |
+                             ImGuiWindowFlags_NoCollapse |
+                             ImGuiWindowFlags_NoSavedSettings |
+                             ImGuiWindowFlags_NoTitleBar |
+                             ImGuiWindowFlags_NoBackground;
+    ImGui::Begin("##c3_left_splitter", nullptr, flags);
+    ImGui::InvisibleButton("##rail_splitter_hit", size);
+    if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        g_uiWantsMouseCapture = true;
+    }
+    if (ImGui::IsItemActive())
+        session.workspaceRailWidth = std::clamp(session.workspaceRailWidth + ImGui::GetIO().MouseDelta.x, 100.0f, 220.0f);
+    ImGui::End();
 }
 
 void beginFixedWindow(const char* name, const ImRect& rect, ImGuiWindowFlags extra = 0, float alpha = 0.96f) {
@@ -325,6 +349,22 @@ void drawWarningPolygons(App& app, const std::vector<WarningPolygon>& warnings,
     }
 }
 
+void drawCrossSectionLine(App& app, ImDrawList* draw, const Viewport& vp, const ImVec2& origin) {
+    if (!app.crossSection())
+        return;
+
+    const ImVec2 a(
+        origin.x + (float)((app.xsStartLon() - vp.center_lon) * vp.zoom + vp.width * 0.5),
+        origin.y + (float)((vp.center_lat - app.xsStartLat()) * vp.zoom + vp.height * 0.5));
+    const ImVec2 b(
+        origin.x + (float)((app.xsEndLon() - vp.center_lon) * vp.zoom + vp.width * 0.5),
+        origin.y + (float)((vp.center_lat - app.xsEndLat()) * vp.zoom + vp.height * 0.5));
+
+    draw->AddLine(a, b, IM_COL32(255, 190, 74, 230), 2.5f);
+    draw->AddCircleFilled(a, 4.0f, IM_COL32(255, 214, 102, 255), 16);
+    draw->AddCircleFilled(b, 4.0f, IM_COL32(255, 214, 102, 255), 16);
+}
+
 void drawCanvas(App& app, ConsoleSession& session, const ShellRegions& regions,
                 const ImGuiViewport* mainViewport,
                 const std::vector<StationUiState>& stations,
@@ -371,6 +411,7 @@ void drawCanvas(App& app, ConsoleSession& session, const ShellRegions& regions,
         app.basemap().drawOverlay(draw, paneVp, rect.Min);
         drawWarningPolygons(app, warnings, draw, paneVp, rect.Min);
         drawStationMarkers(app, stations, draw, paneVp, rect.Min);
+        drawCrossSectionLine(app, draw, paneVp, rect.Min);
         draw->AddRect(rect.Min, rect.Max, IM_COL32(35, 42, 56, 180), 0.0f, 0, 1.0f);
         drawPaneHeader(app, session, stations, draw, rect.Min, 0,
                        app.activeProduct(), app.activeTilt(), true);
@@ -384,6 +425,20 @@ void drawCanvas(App& app, ConsoleSession& session, const ShellRegions& regions,
             draw->AddRectFilled(tl, br, IM_COL32(44, 16, 16, 210), 4.0f);
             draw->AddRect(tl, br, IM_COL32(196, 78, 78, 220), 4.0f);
             draw->AddText(ImVec2(tl.x + 8.0f, tl.y + 4.0f), IM_COL32(255, 220, 220, 240), label);
+        }
+
+        if (app.crossSection()) {
+            const float xsHeight = std::max(220.0f, rect.GetHeight() * 0.34f);
+            const ImRect xsRect(
+                ImVec2(rect.Min.x + 12.0f, rect.Max.y - xsHeight - 12.0f),
+                ImVec2(rect.Max.x - 12.0f, rect.Max.y - 12.0f));
+            draw->AddRectFilled(xsRect.Min, xsRect.Max, IM_COL32(10, 12, 18, 242), 8.0f);
+            draw->AddRect(xsRect.Min, xsRect.Max, IM_COL32(70, 84, 116, 210), 8.0f);
+            if (app.xsTexture().textureId() != 0)
+                draw->AddImage((ImTextureID)(uintptr_t)app.xsTexture().textureId(),
+                               xsRect.Min, xsRect.Max);
+            draw->AddText(ImVec2(xsRect.Min.x + 10.0f, xsRect.Min.y + 8.0f),
+                          IM_COL32(222, 230, 245, 230), "Cross Section");
         }
         draw->PopClipRect();
     }
@@ -541,19 +596,81 @@ void renderTopBar(App& app, ConsoleSession& session, const ShellRegions& regions
 
 void renderRail(App& app, ConsoleSession& session, const ShellRegions& regions) {
     beginFixedWindow("##c3_workspace_rail", regions.leftRail);
-    const std::array<WorkspaceId, 7> items = {
-        WorkspaceId::Live, WorkspaceId::Compare, WorkspaceId::Archive, WorkspaceId::Warning,
-        WorkspaceId::Volume, WorkspaceId::Tools, WorkspaceId::Assets
-    };
-
-    for (WorkspaceId id : items) {
+    auto workspaceButton = [&](WorkspaceId id) {
         const bool active = (id == session.activeWorkspace);
         if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.34f, 0.48f, 1.0f));
-        if (ImGui::Button(workspaceLabel(id), ImVec2(-1.0f, 34.0f))) {
+        if (ImGui::Button(workspaceLabel(id), ImVec2(-1.0f, 34.0f)))
             setWorkspace(app, session, id);
-        }
         if (active) ImGui::PopStyleColor();
+    };
+
+    workspaceButton(WorkspaceId::Live);
+    workspaceButton(WorkspaceId::Compare);
+    workspaceButton(WorkspaceId::Warning);
+
+    const bool archiveActive = (session.activeWorkspace == WorkspaceId::Archive) ||
+                               (session.contextDockOpen && session.activeDockTab == ContextDockTab::Archive);
+    if (archiveActive) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.34f, 0.48f, 1.0f));
+    if (ImGui::Button("Archive", ImVec2(-1.0f, 34.0f))) {
+        session.activeWorkspace = WorkspaceId::Archive;
+        session.contextDockOpen = true;
+        session.activeDockTab = ContextDockTab::Archive;
     }
+    if (archiveActive) ImGui::PopStyleColor();
+
+    const bool mode3DActive = app.mode3D();
+    if (mode3DActive) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.34f, 0.48f, 1.0f));
+    if (ImGui::Button("3D", ImVec2(-1.0f, 34.0f))) {
+        if (app.crossSection())
+            app.toggleCrossSection();
+        app.toggle3D();
+        session.activeWorkspace = app.mode3D() ? WorkspaceId::Volume : WorkspaceId::Live;
+    }
+    if (mode3DActive) ImGui::PopStyleColor();
+
+    const bool xsActive = app.crossSection();
+    if (xsActive) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.34f, 0.48f, 1.0f));
+    if (ImGui::Button("Cross Section", ImVec2(-1.0f, 34.0f))) {
+        if (app.mode3D())
+            app.toggle3D();
+        app.toggleCrossSection();
+        session.activeWorkspace = app.crossSection() ? WorkspaceId::Volume : WorkspaceId::Live;
+    }
+    if (xsActive) ImGui::PopStyleColor();
+
+    const bool toolsActive = (session.activeWorkspace == WorkspaceId::Tools) ||
+                             (session.contextDockOpen && session.activeDockTab == ContextDockTab::Tools);
+    if (toolsActive) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.34f, 0.48f, 1.0f));
+    if (ImGui::Button("Tools", ImVec2(-1.0f, 34.0f))) {
+        session.activeWorkspace = WorkspaceId::Tools;
+        session.contextDockOpen = true;
+        session.activeDockTab = ContextDockTab::Tools;
+    }
+    if (toolsActive) ImGui::PopStyleColor();
+
+    const bool layersActive = session.contextDockOpen && session.activeDockTab == ContextDockTab::Layers;
+    if (layersActive) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.34f, 0.48f, 1.0f));
+    if (ImGui::Button("Layers", ImVec2(-1.0f, 34.0f))) {
+        session.contextDockOpen = true;
+        session.activeDockTab = ContextDockTab::Layers;
+    }
+    if (layersActive) ImGui::PopStyleColor();
+
+    const bool assetsActive = session.contextDockOpen && session.activeDockTab == ContextDockTab::Assets;
+    if (assetsActive) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.34f, 0.48f, 1.0f));
+    if (ImGui::Button("Assets", ImVec2(-1.0f, 34.0f))) {
+        session.contextDockOpen = true;
+        session.activeDockTab = ContextDockTab::Assets;
+    }
+    if (assetsActive) ImGui::PopStyleColor();
+
+    const bool sessionActive = session.contextDockOpen && session.activeDockTab == ContextDockTab::Session;
+    if (sessionActive) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.34f, 0.48f, 1.0f));
+    if (ImGui::Button("Session", ImVec2(-1.0f, 34.0f))) {
+        session.contextDockOpen = true;
+        session.activeDockTab = ContextDockTab::Session;
+    }
+    if (sessionActive) ImGui::PopStyleColor();
 
     ImGui::Separator();
     if (ImGui::Button("CONUS", ImVec2(-1.0f, 32.0f)))
@@ -570,10 +687,43 @@ void renderDock(App& app, ConsoleSession& session, const ShellRegions& regions,
     if (!session.contextDockOpen)
         return;
 
+    static char archiveStation[16] = "KTLX";
+    static int archiveYear = 2025;
+    static int archiveMonth = 3;
+    static int archiveDay = 30;
+    static int archiveStartHour = 21;
+    static int archiveStartMin = 0;
+    static int archiveEndHour = 22;
+    static int archiveEndMin = 0;
+    static char pollingUrl[512] = "";
+    static char palettePath[512] = "";
+    static std::string assetStatus;
+
     beginFixedWindow("##c3_context_dock", regions.rightDock);
-    if (ImGui::BeginTabBar("##dock_tabs")) {
-        if (ImGui::BeginTabItem("Inspect")) {
-            session.activeDockTab = ContextDockTab::Inspect;
+    auto dockTabButton = [&](const char* label, ContextDockTab tab) {
+        const bool active = session.activeDockTab == tab;
+        if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.34f, 0.48f, 1.0f));
+        if (ImGui::Button(label))
+            session.activeDockTab = tab;
+        if (active) ImGui::PopStyleColor();
+    };
+
+    dockTabButton("Inspect", ContextDockTab::Inspect);
+    ImGui::SameLine();
+    dockTabButton("Alerts", ContextDockTab::Alerts);
+    ImGui::SameLine();
+    dockTabButton("Archive", ContextDockTab::Archive);
+    ImGui::SameLine();
+    dockTabButton("Tools", ContextDockTab::Tools);
+    ImGui::SameLine();
+    dockTabButton("Layers", ContextDockTab::Layers);
+    ImGui::SameLine();
+    dockTabButton("Assets", ContextDockTab::Assets);
+    ImGui::SameLine();
+    dockTabButton("Session", ContextDockTab::Session);
+    ImGui::Separator();
+
+    if (session.activeDockTab == ContextDockTab::Inspect) {
             const PaneState& pane = session.panes[session.activePaneIndex];
             ImGui::Text("Focused Station: %s", stationLabelFromId(stations, session.stationWorkflow.focusedStationId).c_str());
             ImGui::Text("Hover Station: %s", stationLabelFromId(stations, session.stationWorkflow.hoveredStationId).c_str());
@@ -592,10 +742,7 @@ void renderDock(App& app, ConsoleSession& session, const ShellRegions& regions,
                 if (!st.latest_scan_utc.empty())
                     ImGui::Text("Latest scan: %s", st.latest_scan_utc.c_str());
             }
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Alerts")) {
-            session.activeDockTab = ContextDockTab::Alerts;
+    } else if (session.activeDockTab == ContextDockTab::Alerts) {
             ImGui::Checkbox("Overlays", &app.m_warningOptions.enabled);
             ImGui::Checkbox("Warnings", &app.m_warningOptions.showWarnings);
             ImGui::SameLine();
@@ -645,10 +792,149 @@ void renderDock(App& app, ConsoleSession& session, const ShellRegions& regions,
                     ImGui::Separator();
                 }
             }
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Layers")) {
-            session.activeDockTab = ContextDockTab::Layers;
+    } else if (session.activeDockTab == ContextDockTab::Archive) {
+            ImGui::Text("Archive and Snapshot");
+            ImGui::Separator();
+            if (ImGui::Button("Return Live", ImVec2(-1.0f, 0.0f))) {
+                app.refreshData();
+                session.activeWorkspace = WorkspaceId::Live;
+            }
+            if (ImGui::Button("March 30 2025 Snapshot", ImVec2(-1.0f, 0.0f))) {
+                app.loadMarch302025Snapshot(false);
+                session.activeWorkspace = WorkspaceId::Archive;
+            }
+            if (ImGui::Button("March 30 2025 Lowest Sweep", ImVec2(-1.0f, 0.0f))) {
+                app.loadMarch302025Snapshot(true);
+                session.activeWorkspace = WorkspaceId::Archive;
+            }
+
+            ImGui::SeparatorText("Historic Events");
+            for (int i = 0; i < NUM_HISTORIC_EVENTS; ++i) {
+                const HistoricEvent& event = HISTORIC_EVENTS[i];
+                const std::string label = std::string(event.name) + "##historic_" + std::to_string(i);
+                if (ImGui::Selectable(label.c_str(), false)) {
+                    app.loadHistoricEvent(i);
+                    session.activeWorkspace = WorkspaceId::Archive;
+                }
+            }
+
+            ImGui::SeparatorText("Custom Range");
+            ImGui::InputText("Station", archiveStation, IM_ARRAYSIZE(archiveStation),
+                             ImGuiInputTextFlags_CharsUppercase);
+            ImGui::InputInt("Year", &archiveYear);
+            ImGui::InputInt("Month", &archiveMonth);
+            ImGui::InputInt("Day", &archiveDay);
+            ImGui::InputInt("Start Hour", &archiveStartHour);
+            ImGui::InputInt("Start Min", &archiveStartMin);
+            ImGui::InputInt("End Hour", &archiveEndHour);
+            ImGui::InputInt("End Min", &archiveEndMin);
+            archiveMonth = std::clamp(archiveMonth, 1, 12);
+            archiveDay = std::clamp(archiveDay, 1, 31);
+            archiveStartHour = std::clamp(archiveStartHour, 0, 23);
+            archiveEndHour = std::clamp(archiveEndHour, 0, 23);
+            archiveStartMin = std::clamp(archiveStartMin, 0, 59);
+            archiveEndMin = std::clamp(archiveEndMin, 0, 59);
+            if (ImGui::Button("Load Range", ImVec2(-1.0f, 0.0f))) {
+                app.loadArchiveRange(archiveStation, archiveYear, archiveMonth, archiveDay,
+                                     archiveStartHour, archiveStartMin, archiveEndHour, archiveEndMin);
+                session.activeWorkspace = WorkspaceId::Archive;
+            }
+            ImGui::TextDisabled("Loaded %d / %d", app.m_historic.downloadedFrames(), app.m_historic.totalFrames());
+            const std::string archiveError = app.m_historic.lastError();
+            if (!archiveError.empty())
+                ImGui::TextWrapped("%s", archiveError.c_str());
+
+            ImGui::SeparatorText("Projection");
+            int projectionIdx = (int)app.archiveProjectionKind();
+            const char* projectionLabels[] = {"Volume Timeline", "Sweep Stream"};
+            if (ImGui::Combo("Archive Source", &projectionIdx, projectionLabels, IM_ARRAYSIZE(projectionLabels)))
+                app.setArchiveProjectionKind((ArchiveProjectionKind)projectionIdx);
+
+            if (app.archiveProjectionKind() == ArchiveProjectionKind::SweepStream) {
+                const auto& point = app.archiveInterrogationPoint();
+                ImGui::TextDisabled("Default: smooth sub-1.5 degree sweeps with the active product.");
+                if (ImGui::Button(app.archiveSweepPointPickArmed() ? "Click Map To Set Point" : "Pick Point On Map",
+                                  ImVec2(-1.0f, 0.0f))) {
+                    app.armArchiveSweepPointPick(!app.archiveSweepPointPickArmed());
+                }
+                if (ImGui::Button("Use Cursor Position", ImVec2(-1.0f, 0.0f))) {
+                    app.setArchiveInterrogationPoint(app.cursorLat(), app.cursorLon());
+                }
+                if (point.valid) {
+                    ImGui::Text("Point %.3f, %.3f", point.lat, point.lon);
+                } else {
+                    ImGui::TextDisabled("No interrogation point selected (using sweep-only ordering)");
+                }
+
+                SweepFilter filter = app.archiveSweepFilter();
+                bool filterChanged = false;
+                int styleIdx = (int)filter.style;
+                const char* styleLabels[] = {"Dense", "Smooth", "Strict Smooth"};
+                if (ImGui::Combo("Sweep Style", &styleIdx, styleLabels, IM_ARRAYSIZE(styleLabels))) {
+                    filter.style = (SweepStreamStyle)styleIdx;
+                    filterChanged = true;
+                }
+                filterChanged |= ImGui::Checkbox("Sub-1.5 Only", &filter.sub_1p5_only);
+                filterChanged |= ImGui::Checkbox("Require Active Product At Point", &filter.require_active_product);
+                filterChanged |= ImGui::Checkbox("Require Any Point Coverage", &filter.require_point_coverage);
+                bool limitBeamHeight = filter.max_beam_height_arl_m >= 0.0f;
+                if (ImGui::Checkbox("Limit Beam Height", &limitBeamHeight)) {
+                    filter.max_beam_height_arl_m = limitBeamHeight
+                        ? std::max(1500.0f, filter.max_beam_height_arl_m)
+                        : -1.0f;
+                    filterChanged = true;
+                }
+                if (limitBeamHeight) {
+                    float beamHeightKm = filter.max_beam_height_arl_m / 1000.0f;
+                    if (ImGui::SliderFloat("Max Beam Height (km)", &beamHeightKm, 0.1f, 10.0f, "%.1f")) {
+                        filter.max_beam_height_arl_m = beamHeightKm * 1000.0f;
+                        filterChanged = true;
+                    }
+                }
+                bool limitElevation = filter.max_elevation_deg >= 0.0f;
+                if (ImGui::Checkbox("Limit Elevation", &limitElevation)) {
+                    filter.max_elevation_deg = limitElevation
+                        ? std::max(1.5f, filter.max_elevation_deg)
+                        : -1.0f;
+                    filterChanged = true;
+                }
+                if (limitElevation) {
+                    float maxElevation = filter.max_elevation_deg;
+                    if (ImGui::SliderFloat("Max Elevation (deg)", &maxElevation, 0.1f, 10.0f, "%.1f")) {
+                        filter.max_elevation_deg = maxElevation;
+                        filterChanged = true;
+                    }
+                }
+                if (filterChanged)
+                    app.setArchiveSweepFilter(filter);
+
+                const auto& timeline = app.archiveSweepTimeline();
+                ImGui::SeparatorText("Sweep Stream");
+                ImGui::Text("Kept %d / %d sweeps", (int)timeline.frames.size(), timeline.candidate_frames);
+                ImGui::TextDisabled("%s", timeline.complete ? "Archive load complete" : "Timeline grows as frames load");
+                if (!timeline.frames.empty()) {
+                    ImGui::TextWrapped("Current: %s", app.transportSnapshot().current_label.c_str());
+                }
+            }
+    } else if (session.activeDockTab == ContextDockTab::Tools) {
+            bool srv = app.srvMode();
+            if (ImGui::Checkbox("Storm Relative Velocity", &srv))
+                app.toggleSRV();
+            float stormSpeed = app.stormSpeed();
+            if (ImGui::SliderFloat("Storm Speed", &stormSpeed, 0.0f, 40.0f, "%.1f m/s"))
+                app.setStormMotion(stormSpeed, app.stormDir());
+            float stormDir = app.stormDir();
+            if (ImGui::SliderFloat("Storm Dir", &stormDir, 0.0f, 360.0f, "%.0f deg"))
+                app.setStormMotion(app.stormSpeed(), stormDir);
+            ImGui::Checkbox("Dealias Velocity", &app.m_dealias);
+            float threshold = app.dbzMinThreshold();
+            if (ImGui::SliderFloat(app.activeProduct() == PROD_VEL ? "Velocity Threshold" : "Reflectivity Threshold",
+                                   &threshold, 0.0f, app.activeProduct() == PROD_VEL ? 80.0f : 80.0f, "%.1f"))
+                app.setDbzMinThreshold(threshold);
+            if (ImGui::Button("Refresh Data", ImVec2(-1.0f, 0.0f)))
+                app.refreshData();
+            ImGui::TextWrapped("%s", app.priorityStatus().c_str());
+    } else if (session.activeDockTab == ContextDockTab::Layers) {
             int basemapIdx = (int)app.basemap().style();
             const char* basemapLabels[] = {"Relief", "Ops Dark", "Satellite", "Satellite Hybrid"};
             if (ImGui::Combo("Basemap", &basemapIdx, basemapLabels, IM_ARRAYSIZE(basemapLabels)))
@@ -668,10 +954,7 @@ void renderDock(App& app, ConsoleSession& session, const ShellRegions& regions,
             bool citiesOn = app.basemap().showCityLabels();
             if (ImGui::Checkbox("Cities", &citiesOn))
                 app.basemap().setShowCityLabels(citiesOn);
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Assets")) {
-            session.activeDockTab = ContextDockTab::Assets;
+    } else if (session.activeDockTab == ContextDockTab::Assets) {
             int profileIdx = (int)app.requestedPerformanceProfile();
             const char* profileLabels[] = {"Auto", "Quality", "Balanced", "Performance"};
             if (ImGui::Combo("Profile", &profileIdx, profileLabels, IM_ARRAYSIZE(profileLabels)))
@@ -680,11 +963,42 @@ void renderDock(App& app, ConsoleSession& session, const ShellRegions& regions,
             bool showExperimental = app.showExperimentalSites();
             if (ImGui::Checkbox("Experimental Sites", &showExperimental))
                 app.setShowExperimentalSites(showExperimental);
+            ImGui::SeparatorText("Color Tables");
+            ImGui::InputText("Palette Path", palettePath, IM_ARRAYSIZE(palettePath));
+            if (ImGui::Button("Load Palette", ImVec2(-1.0f, 0.0f))) {
+                assetStatus = app.loadColorTableFromFile(palettePath) ? app.colorTableStatus() : app.colorTableStatus();
+            }
+            if (ImGui::Button("Reset Active Palette", ImVec2(-1.0f, 0.0f))) {
+                app.resetColorTable(app.activeProduct());
+                assetStatus = app.colorTableStatus();
+            }
+            ImGui::SeparatorText("Polling Links");
+            ImGui::InputText("URL", pollingUrl, IM_ARRAYSIZE(pollingUrl));
+            if (ImGui::Button("Add Polling Link", ImVec2(-1.0f, 0.0f))) {
+                std::string error;
+                if (app.m_pollingLinks.addLink(pollingUrl, error)) {
+                    assetStatus = "Added polling link";
+                    pollingUrl[0] = '\0';
+                } else {
+                    assetStatus = error.empty() ? "Failed to add polling link" : error;
+                }
+            }
+            if (ImGui::Button("Refresh Links", ImVec2(-1.0f, 0.0f)))
+                app.m_pollingLinks.refreshAll();
+            const auto links = app.m_pollingLinks.entries();
+            for (size_t i = 0; i < links.size(); ++i) {
+                ImGui::Separator();
+                ImGui::TextWrapped("%s", links[i].title.empty() ? links[i].url.c_str() : links[i].title.c_str());
+                ImGui::TextDisabled("%s", links[i].last_status.c_str());
+                if (ImGui::SmallButton((std::string("Remove##poll_") + std::to_string(i)).c_str())) {
+                    app.m_pollingLinks.removeLink(i);
+                    break;
+                }
+            }
+            if (!assetStatus.empty())
+                ImGui::TextWrapped("%s", assetStatus.c_str());
             ImGui::TextWrapped("%s", app.priorityStatus().c_str());
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Session")) {
-            session.activeDockTab = ContextDockTab::Session;
+    } else if (session.activeDockTab == ContextDockTab::Session) {
             if (ImGui::Button("Solo Live", ImVec2(-1.0f, 28.0f))) {
                 setWorkspace(app, session, WorkspaceId::Live);
             }
@@ -695,9 +1009,6 @@ void renderDock(App& app, ConsoleSession& session, const ShellRegions& regions,
                 activateTornadoInterrogate(app, session, warnings, stations);
             }
             ImGui::TextDisabled("Workspaces are now shell state, not just panel toggles.");
-            ImGui::EndTabItem();
-        }
-        ImGui::EndTabBar();
     }
     endFixedWindow();
 }
@@ -828,6 +1139,10 @@ void handleCanvasInteractions(App& app, ConsoleSession& session,
     }
 
     if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (app.archiveSweepPointPickArmed()) {
+            app.setArchiveInterrogationPoint(app.cursorLat(), app.cursorLon());
+            return;
+        }
         session.activePaneIndex = hoveredPane;
         applySelectedPaneToApp(app, session);
 
@@ -890,7 +1205,8 @@ void render(App& app) {
     const auto stations = app.stations();
     const auto warnings = app.currentWarnings();
     syncConsoleSessionFromApp(app, stations, warnings, session);
-    const ShellRegions regions = computeRegions(mainViewport, session.contextDockOpen);
+    const ShellRegions regions = computeRegions(mainViewport, session.contextDockOpen, session.workspaceRailWidth);
+    handleRailResize(session, regions);
 
     drawCanvas(app, session, regions, mainViewport, stations, warnings);
     renderTopBar(app, session, regions, stations, warnings);

@@ -162,6 +162,8 @@ struct ParsedRadial {
     float azimuth;              // degrees [0, 360)
     float elevation;            // degrees
     uint8_t radial_status;      // sweep boundary indicator
+    int64_t collection_epoch_ms = 0;
+    uint16_t azimuth_number = 0;
     std::vector<ParsedMoment> moments;
 };
 

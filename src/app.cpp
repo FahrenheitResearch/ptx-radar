@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <ctime>
 #include <iterator>
 #include <limits>
 #include <regex>
@@ -63,6 +64,134 @@ std::string formatVolumeKeyTimestamp(const std::string& key) {
     }
 
     return filename;
+}
+
+std::string formatEpochMsUtc(int64_t epochMs) {
+    if (epochMs <= 0)
+        return {};
+    const std::time_t seconds = static_cast<std::time_t>(epochMs / 1000);
+    std::tm tm = {};
+#ifdef _WIN32
+    gmtime_s(&tm, &seconds);
+#else
+    gmtime_r(&seconds, &tm);
+#endif
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "%02d:%02d:%02dZ",
+                  tm.tm_hour, tm.tm_min, tm.tm_sec);
+    return buffer;
+}
+
+float angleDeltaDeg(float a, float b) {
+    float delta = fmodf(fabsf(a - b), 360.0f);
+    if (delta > 180.0f)
+        delta = 360.0f - delta;
+    return delta;
+}
+
+int nearestRadialIndex(const PrecomputedSweep& sweep, float azimuthDeg, float* outErrorDeg = nullptr) {
+    if (sweep.num_radials <= 0 || sweep.azimuths.empty())
+        return -1;
+    int bestIdx = 0;
+    float bestDelta = angleDeltaDeg(sweep.azimuths[0], azimuthDeg);
+    for (int i = 1; i < sweep.num_radials; ++i) {
+        const float delta = angleDeltaDeg(sweep.azimuths[i], azimuthDeg);
+        if (delta < bestDelta) {
+            bestDelta = delta;
+            bestIdx = i;
+        }
+    }
+    if (outErrorDeg)
+        *outErrorDeg = bestDelta;
+    return bestIdx;
+}
+
+bool explicitTiltAllowed(const SweepFilter& filter, float elevationDeg) {
+    if (filter.explicit_tilt_set_deg.empty())
+        return true;
+    for (float allowed : filter.explicit_tilt_set_deg) {
+        if (fabsf(allowed - elevationDeg) <= 0.11f)
+            return true;
+    }
+    return false;
+}
+
+std::vector<SweepFrameRef> smoothSweepCandidates(std::vector<SweepFrameRef> candidates,
+                                                 SweepStreamStyle style,
+                                                 bool usePoint) {
+    if (style == SweepStreamStyle::Dense || candidates.size() <= 2)
+        return candidates;
+
+    struct TiltBucket {
+        int key = 0;
+        int count = 0;
+    };
+
+    std::vector<TiltBucket> buckets;
+    buckets.reserve(8);
+    auto addBucket = [&buckets](float elevationDeg) {
+        const int key = (int)std::lround(elevationDeg * 10.0f);
+        for (auto& bucket : buckets) {
+            if (bucket.key == key) {
+                ++bucket.count;
+                return;
+            }
+        }
+        buckets.push_back({key, 1});
+    };
+
+    for (const auto& cand : candidates)
+        addBucket(cand.elevation_deg);
+
+    std::sort(buckets.begin(), buckets.end(), [](const TiltBucket& a, const TiltBucket& b) {
+        if (a.count != b.count)
+            return a.count > b.count;
+        return a.key < b.key;
+    });
+
+    const float primaryElev = buckets.empty() ? candidates.front().elevation_deg : (float)buckets.front().key / 10.0f;
+    const float secondaryElev =
+        (buckets.size() > 1) ? (float)buckets[1].key / 10.0f : primaryElev;
+    const bool hasSecondary = buckets.size() > 1;
+
+    const float primaryTol = 0.06f;
+    const float secondaryTol = 0.06f;
+
+    std::vector<SweepFrameRef> smoothed;
+    smoothed.reserve(candidates.size());
+
+    for (const auto& cand : candidates) {
+        const bool inPrimary = fabsf(cand.elevation_deg - primaryElev) <= primaryTol;
+        const bool inSecondary = hasSecondary && fabsf(cand.elevation_deg - secondaryElev) <= secondaryTol;
+
+        if (style == SweepStreamStyle::StrictSmooth) {
+            if (!inPrimary)
+                continue;
+        } else {
+            if (!inPrimary && !inSecondary)
+                continue;
+        }
+
+        if (!smoothed.empty()) {
+            if (usePoint) {
+                const float beamDiff = fabsf(cand.beam_height_arl_m - smoothed.back().beam_height_arl_m);
+                const float maxBeamDelta = (style == SweepStreamStyle::StrictSmooth) ? 1200.0f : 2500.0f;
+                if (beamDiff > maxBeamDelta && !inPrimary)
+                    continue;
+            }
+        }
+
+        smoothed.push_back(cand);
+    }
+
+    if (smoothed.empty()) {
+        for (const auto& cand : candidates) {
+            if (fabsf(cand.elevation_deg - primaryElev) <= primaryTol)
+                smoothed.push_back(cand);
+        }
+    }
+
+    return smoothed.empty() ? candidates : smoothed;
 }
 
 bool extractVolumeKeyDate(const std::string& key, int& year, int& month, int& day) {
@@ -531,14 +660,63 @@ int findLowestParsedSweepIndex(const ParsedRadarData& parsed) {
 
 PrecomputedSweep buildPrecomputedSweep(const ParsedSweep& sweep) {
     PrecomputedSweep pc;
+    pc.meta.sweep_number = sweep.sweep_number;
     pc.elevation_angle = sweep.elevation_angle;
     pc.num_radials = (int)sweep.radials.size();
     if (pc.num_radials == 0)
         return pc;
 
+    pc.meta.radial_count = (uint16_t)std::min(pc.num_radials, 0xFFFF);
+    pc.meta.timing_exact = true;
+    bool sawSweepStart = false;
+    bool sawSweepEnd = false;
+    int64_t minEpoch = std::numeric_limits<int64_t>::max();
+    int64_t maxEpoch = std::numeric_limits<int64_t>::min();
     pc.azimuths.resize(pc.num_radials);
+    pc.radial_time_offset_ms.resize(pc.num_radials);
     for (int r = 0; r < pc.num_radials; r++)
         pc.azimuths[r] = sweep.radials[r].azimuth;
+
+    if (!sweep.radials.empty()) {
+        pc.meta.first_azimuth_number = sweep.radials.front().azimuth_number;
+        pc.meta.last_azimuth_number = sweep.radials.back().azimuth_number;
+    }
+
+    for (const auto& radial : sweep.radials) {
+        if (radial.collection_epoch_ms <= 0) {
+            pc.meta.timing_exact = false;
+        } else {
+            minEpoch = std::min(minEpoch, radial.collection_epoch_ms);
+            maxEpoch = std::max(maxEpoch, radial.collection_epoch_ms);
+        }
+
+        switch (radial.radial_status) {
+            case 0:
+            case 3:
+                sawSweepStart = true;
+                break;
+            case 2:
+            case 4:
+                sawSweepEnd = true;
+                break;
+            default:
+                break;
+        }
+    }
+
+    if (minEpoch != std::numeric_limits<int64_t>::max() &&
+        maxEpoch != std::numeric_limits<int64_t>::min()) {
+        pc.meta.sweep_start_epoch_ms = minEpoch;
+        pc.meta.sweep_end_epoch_ms = maxEpoch;
+        pc.meta.sweep_display_epoch_ms = minEpoch + (maxEpoch - minEpoch) / 2;
+        for (int r = 0; r < pc.num_radials; ++r) {
+            const int64_t delta = sweep.radials[r].collection_epoch_ms - minEpoch;
+            pc.radial_time_offset_ms[r] = (uint32_t)std::max<int64_t>(0, delta);
+        }
+    } else {
+        pc.radial_time_offset_ms.assign(pc.num_radials, 0);
+    }
+    pc.meta.boundary_complete = sawSweepStart && sawSweepEnd;
 
     for (const auto& radial : sweep.radials) {
         for (const auto& moment : radial.moments) {
@@ -552,6 +730,7 @@ PrecomputedSweep buildPrecomputedSweep(const ParsedSweep& sweep) {
                 pd.gate_spacing_km = moment.gate_spacing_m / 1000.0f;
                 pd.scale = moment.scale;
                 pd.offset = moment.offset;
+                pc.meta.product_mask |= (1u << p);
             }
         }
     }
@@ -662,12 +841,14 @@ std::vector<PrecomputedSweep> buildReducedWorkingSetSweeps(std::vector<Precomput
 
 PrecomputedSweep buildPrecomputedSweep(const gpu_pipeline::GpuIngestResult& ingest) {
     PrecomputedSweep sweep;
+    sweep.meta.radial_count = (uint16_t)std::min(ingest.num_radials, 0xFFFF);
     sweep.elevation_angle = ingest.elevation_angle;
     sweep.num_radials = ingest.num_radials;
     if (ingest.num_radials <= 0 || !ingest.d_azimuths)
         return sweep;
 
     sweep.azimuths.resize(ingest.num_radials);
+    sweep.radial_time_offset_ms.assign(ingest.num_radials, 0);
     CUDA_CHECK(cudaMemcpy(sweep.azimuths.data(), ingest.d_azimuths,
                           (size_t)ingest.num_radials * sizeof(float), cudaMemcpyDeviceToHost));
 
@@ -682,6 +863,7 @@ PrecomputedSweep buildPrecomputedSweep(const gpu_pipeline::GpuIngestResult& inge
         pd.gate_spacing_km = ingest.gate_spacing_km[p];
         pd.scale = ingest.scale[p];
         pd.offset = ingest.offset[p];
+        sweep.meta.product_mask |= (1u << p);
         pd.gates.resize((size_t)pd.num_gates * (size_t)ingest.num_radials);
         CUDA_CHECK(cudaMemcpy(pd.gates.data(), ingest.d_gates[p],
                               pd.gates.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost));
@@ -1152,12 +1334,12 @@ static constexpr int kPanelCacheSlotBase = MAX_STATIONS - 5;
 App::App()
     : m_spatialGrid(std::make_unique<SpatialGrid>()) {
     m_priorityStatus = "Startup seed pending";
-    m_warningOptions.enabled = false;
-    m_warningOptions.showWarnings = false;
-    m_warningOptions.showWatches = false;
-    m_warningOptions.showStatements = false;
+    m_warningOptions.enabled = true;
+    m_warningOptions.showWarnings = true;
+    m_warningOptions.showWatches = true;
+    m_warningOptions.showStatements = true;
     m_warningOptions.showAdvisories = false;
-    m_warningOptions.showSpecialWeatherStatements = false;
+    m_warningOptions.showSpecialWeatherStatements = true;
 }
 
 App::~App() {
@@ -1560,6 +1742,7 @@ bool App::ensureStationFullVolume(int stationIdx) {
     float detectionLat = fallbackLat;
     float detectionLon = fallbackLon;
     int totalSweeps = 0;
+
     auto parseStart = Clock::now();
     parsed = Level2Parser::parseDecodedMessages(decoded, stationName);
     timings.parse_ms = elapsedMs(parseStart, Clock::now());
@@ -1611,17 +1794,24 @@ bool App::ensureStationFullVolume(int stationIdx) {
 void App::ensureRenderTargets() {
     const int rw = renderWidth();
     const int rh = renderHeight();
+    int maxRw = rw;
+    int maxRh = rh;
+    const int panelCountForBuffer = panelRenderCount();
+    for (int i = 1; i < panelCountForBuffer; ++i) {
+        maxRw = std::max(maxRw, panelRenderWidth(i));
+        maxRh = std::max(maxRh, panelRenderHeight(i));
+    }
     const bool sizeChanged =
         !m_d_compositeOutput ||
-        m_memoryTelemetry.internal_render_width != rw ||
-        m_memoryTelemetry.internal_render_height != rh;
+        m_memoryTelemetry.internal_render_width != maxRw ||
+        m_memoryTelemetry.internal_render_height != maxRh;
 
     if (sizeChanged) {
         if (m_d_compositeOutput) {
             cudaFree(m_d_compositeOutput);
             m_d_compositeOutput = nullptr;
         }
-        const size_t outSize = (size_t)rw * rh * sizeof(uint32_t);
+        const size_t outSize = (size_t)maxRw * maxRh * sizeof(uint32_t);
         CUDA_CHECK(cudaMalloc(&m_d_compositeOutput, outSize));
         CUDA_CHECK(cudaMemset(m_d_compositeOutput, 0, outSize));
     }
@@ -1648,8 +1838,8 @@ void App::ensureRenderTargets() {
         }
     }
 
-    m_memoryTelemetry.internal_render_width = rw;
-    m_memoryTelemetry.internal_render_height = rh;
+    m_memoryTelemetry.internal_render_width = maxRw;
+    m_memoryTelemetry.internal_render_height = maxRh;
     m_memoryTelemetry.render_scale = m_renderScale;
 }
 
@@ -2130,7 +2320,7 @@ void App::requestProbSevereRefresh(bool force) {
 }
 
 void App::invalidateLiveLoop(bool freeMemory, bool preservePlayback) {
-    const bool keepPlaying = preservePlayback && m_liveLoopPlaying;
+    const bool keepPlaying = preservePlayback && m_liveLoopPlayIntent;
     m_liveLoopBackfillGeneration.fetch_add(1);
     m_liveLoopBackfillLoading = false;
     m_liveLoopBackfillDeferFrames = 0;
@@ -2146,7 +2336,8 @@ void App::invalidateLiveLoop(bool freeMemory, bool preservePlayback) {
     m_liveLoopBackfillFetchCompleted = 0;
     m_liveLoopBackfillReplaceExisting = false;
     resetLiveLoopFrameCache(freeMemory);
-    m_liveLoopPlaying = keepPlaying;
+    m_liveLoopPlayIntent = keepPlaying;
+    m_liveLoopPlaying = keepPlaying && m_liveLoopCount > 1;
 }
 
 void App::resetLiveLoopFrameCache(bool freeMemory) {
@@ -2198,7 +2389,7 @@ void App::scheduleInteractiveLiveLoopBackfill() {
     if (!m_liveLoopEnabled || m_historicMode || m_snapshotMode || m_mode3D || m_crossSection || m_showAll)
         return;
 
-    const bool keepPlaying = m_liveLoopPlaying;
+    const bool keepPlaying = m_liveLoopPlayIntent;
 
     // Interactive view/product/tilt changes should only reset the rendered loop
     // view, not cancel in-flight source downloads/history growth.
@@ -2211,7 +2402,8 @@ void App::scheduleInteractiveLiveLoopBackfill() {
     }
     m_liveLoopBackfillDeferFrames = std::max(m_liveLoopBackfillDeferFrames, 1);
     m_liveLoopInteractiveBackfill = true;
-    m_liveLoopPlaying = keepPlaying;
+    m_liveLoopPlayIntent = keepPlaying;
+    m_liveLoopPlaying = keepPlaying && m_liveLoopCount > 1;
     requestLiveLoopCapture();
     if (m_liveLoopBackfillLoading.load())
         m_liveLoopLocalRefreshPending = true;
@@ -2234,7 +2426,7 @@ void App::requestLiveLoopBackfillForViewRefresh() {
     }
 
     const int desiredFrames = std::max(1, std::min(m_liveLoopLength, MAX_LIVE_LOOP_FRAMES));
-    queueLiveLoopFramesFromHistory(m_activeStationIdx, desiredFrames, true);
+    queueLiveLoopFramesFromHistory(m_activeStationIdx, desiredFrames, false);
 }
 
 void App::queueLiveLoopFramesFromHistory(int stationIdx, int desiredFrames, bool replaceExisting) {
@@ -2289,7 +2481,8 @@ void App::queueLiveLoopFramesFromHistory(int stationIdx, int desiredFrames, bool
     }
 
     if (localFrames.empty()) {
-        resetLiveLoopFrameCache(false);
+        if (replaceExisting)
+            resetLiveLoopFrameCache(false);
         requestLiveLoopCapture();
     }
 }
@@ -2485,15 +2678,14 @@ void App::requestLiveLoopBackfillImpl(bool allowDownload) {
                                 return;
                             }
 
+                            LiveLoopBackfillFrame frame;
+                            frame.volume_key = id;
+                            frame.label = formatVolumeKeyTimestamp(id);
                             auto parsed = Level2Parser::parse(result.data);
                             if (parsed.sweeps.empty()) {
                                 finishOne();
                                 return;
                             }
-
-                            LiveLoopBackfillFrame frame;
-                            frame.volume_key = id;
-                            frame.label = formatVolumeKeyTimestamp(id);
                             frame.sweeps = buildPrecomputedSweeps(parsed);
                             if (dealiasEnabled)
                                 dealiasPrecomputedSweeps(frame.sweeps);
@@ -2589,17 +2781,26 @@ void App::captureLiveLoopFrame(const uint32_t* d_src, int w, int h,
     m_liveLoopLabels[slot] = label;
     m_liveLoopVolumeKeys[slot] = volumeKey;
 
+    const bool preservePlaybackCursor = m_liveLoopPlayIntent && m_liveLoopCount > 0;
     if (m_liveLoopCount < m_liveLoopLength)
         m_liveLoopCount++;
 
     m_liveLoopWriteIndex = (m_liveLoopWriteIndex + 1) % MAX_LIVE_LOOP_FRAMES;
-    m_liveLoopPlaybackIndex = std::max(0, m_liveLoopCount - 1);
+    if (!preservePlaybackCursor)
+        m_liveLoopPlaybackIndex = std::max(0, m_liveLoopCount - 1);
+    else if (m_liveLoopPlaybackIndex >= m_liveLoopCount)
+        m_liveLoopPlaybackIndex = std::max(0, m_liveLoopCount - 1);
+    m_liveLoopPlaying = m_liveLoopPlayIntent && m_liveLoopCount > 1;
     m_liveLoopCapturePending = false;
 }
 
 void App::updateLiveLoop(float dt) {
-    if (!m_liveLoopEnabled || !m_liveLoopPlaying || m_liveLoopCount <= 1)
+    if (!m_liveLoopEnabled || !m_liveLoopPlayIntent || m_liveLoopCount <= 1) {
+        m_liveLoopPlaying = false;
         return;
+    }
+
+    m_liveLoopPlaying = true;
 
     const float fps = std::max(1.0f, m_liveLoopSpeed);
     m_liveLoopAccumulator += dt;
@@ -2737,6 +2938,7 @@ void App::setLiveLoopEnabled(bool enabled) {
     m_liveLoopEnabled = enabled;
     if (!enabled) {
         invalidateLiveLoop(true);
+        m_liveLoopPlayIntent = false;
         return;
     }
 
@@ -2746,13 +2948,15 @@ void App::setLiveLoopEnabled(bool enabled) {
 void App::toggleLiveLoopPlayback() {
     if (!m_liveLoopEnabled)
         setLiveLoopEnabled(true);
+    m_liveLoopPlayIntent = !m_liveLoopPlayIntent;
     if (m_liveLoopCount <= 1) {
         m_liveLoopPlaying = false;
-        requestLiveLoopCapture();
+        if (m_liveLoopPlayIntent)
+            requestLiveLoopBackfill();
         return;
     }
 
-    m_liveLoopPlaying = !m_liveLoopPlaying;
+    m_liveLoopPlaying = m_liveLoopPlayIntent;
     m_liveLoopAccumulator = 0.0f;
 }
 
@@ -2778,11 +2982,13 @@ void App::setLiveLoopPlaybackFrame(int index) {
     if (m_liveLoopCount <= 0) {
         m_liveLoopPlaybackIndex = 0;
         m_liveLoopPlaying = false;
+        m_liveLoopPlayIntent = false;
         return;
     }
 
     m_liveLoopPlaybackIndex = std::max(0, std::min(index, m_liveLoopCount - 1));
     m_liveLoopPlaying = false;
+    m_liveLoopPlayIntent = false;
     m_liveLoopAccumulator = 0.0f;
 }
 
@@ -2825,40 +3031,290 @@ void App::clearLiveLoop() {
     invalidateLiveLoop(true);
 }
 
+bool App::archiveSweepStreamActive() const {
+    return m_historicMode && m_archiveProjectionKind == ArchiveProjectionKind::SweepStream;
+}
+
+int App::archiveFrameCount() const {
+    return archiveSweepStreamActive()
+        ? (int)m_archiveSweepTimeline.frames.size()
+        : m_historic.numFrames();
+}
+
+const RadarFrame* App::archiveFrameForTransportCursor(int* outSweepIndex) const {
+    if (outSweepIndex)
+        *outSweepIndex = -1;
+
+    if (archiveSweepStreamActive()) {
+        if (m_archiveSweepCursor < 0 || m_archiveSweepCursor >= (int)m_archiveSweepTimeline.frames.size())
+            return nullptr;
+        const auto& ref = m_archiveSweepTimeline.frames[m_archiveSweepCursor];
+        if (outSweepIndex)
+            *outSweepIndex = ref.sweep_index;
+        return m_historic.frame(ref.volume_frame_index);
+    }
+
+    return m_historic.frame(m_historic.currentFrame());
+}
+
+std::string App::archiveCurrentLabel() const {
+    if (archiveSweepStreamActive()) {
+        if (m_archiveSweepCursor < 0 || m_archiveSweepCursor >= (int)m_archiveSweepTimeline.frames.size())
+            return m_historic.currentLabel();
+        return m_archiveSweepTimeline.frames[m_archiveSweepCursor].label;
+    }
+    return m_historic.currentLabel();
+}
+
+void App::setArchiveProjectionKind(ArchiveProjectionKind kind) {
+    if (m_archiveProjectionKind == kind)
+        return;
+    m_archiveProjectionKind = kind;
+    if (kind == ArchiveProjectionKind::SweepStream) {
+        m_archiveSweepFilter.sub_1p5_only = true;
+        m_archiveSweepFilter.require_active_product = true;
+        m_archiveSweepFilter.require_point_coverage = false;
+        m_archiveSweepFilter.max_beam_height_arl_m = -1.0f;
+        m_archiveSweepFilter.max_elevation_deg = -1.0f;
+        m_archiveSweepFilter.style = SweepStreamStyle::Smooth;
+    }
+    m_archiveSweepCursor = 0;
+    m_archiveSweepPlaying = false;
+    m_archiveSweepAccumulator = 0.0f;
+    m_lastHistoricFrame = -1;
+    invalidatePanelCaches();
+    resetHistoricFrameCache(true);
+    m_needsRerender = true;
+    m_needsComposite = true;
+    if (m_historicMode) {
+        rebuildArchiveSweepTimeline();
+    }
+}
+
+void App::setArchiveInterrogationPoint(float lat, float lon) {
+    m_archiveInterrogationPoint.valid = true;
+    m_archiveInterrogationPoint.lat = lat;
+    m_archiveInterrogationPoint.lon = lon;
+    m_archiveSweepPointPickArmed = false;
+    m_lastHistoricFrame = -1;
+    m_needsRerender = true;
+    m_needsComposite = true;
+    if (m_historicMode && m_archiveProjectionKind == ArchiveProjectionKind::SweepStream)
+        rebuildArchiveSweepTimeline();
+}
+
+void App::setArchiveSweepFilter(const SweepFilter& filter) {
+    m_archiveSweepFilter = filter;
+    m_lastHistoricFrame = -1;
+    m_needsRerender = true;
+    m_needsComposite = true;
+    if (m_historicMode && m_archiveProjectionKind == ArchiveProjectionKind::SweepStream)
+        rebuildArchiveSweepTimeline();
+}
+
+void App::rebuildArchiveSweepTimeline() {
+    m_archiveSweepTimeline = {};
+    m_archiveSweepTimeline.point = m_archiveInterrogationPoint;
+    m_archiveSweepTimeline.filter = m_archiveSweepFilter;
+    m_archiveSweepTimeline.complete = m_historic.loaded();
+    m_archiveSweepLastSourceCount = m_historic.downloadedFrames();
+
+    if (!m_historicMode || m_archiveProjectionKind != ArchiveProjectionKind::SweepStream)
+        return;
+
+    const bool usePoint = m_archiveInterrogationPoint.valid;
+
+    std::vector<SweepFrameRef> candidates;
+    candidates.reserve(std::max(32, m_historic.numFrames() * 4));
+
+    for (int frameIdx = 0; frameIdx < m_historic.numFrames(); ++frameIdx) {
+        const RadarFrame* frame = m_historic.frame(frameIdx);
+        if (!frame || !frame->ready)
+            continue;
+
+        const float rangeKm = usePoint
+            ? (float)haversineKm(frame->station_lat, frame->station_lon,
+                                 m_archiveInterrogationPoint.lat, m_archiveInterrogationPoint.lon)
+            : 0.0f;
+        const float pointAzimuth = usePoint
+            ? (float)azimuthDeg(frame->station_lat, frame->station_lon,
+                                m_archiveInterrogationPoint.lat, m_archiveInterrogationPoint.lon)
+            : 0.0f;
+
+        for (int sweepIdx = 0; sweepIdx < (int)frame->sweeps.size(); ++sweepIdx) {
+            const auto& sweep = frame->sweeps[sweepIdx];
+            if (sweep.num_radials <= 0)
+                continue;
+
+            ++m_archiveSweepTimeline.candidate_frames;
+
+            if (m_archiveSweepFilter.sub_1p5_only && sweep.elevation_angle > 1.5f)
+                continue;
+            if (m_archiveSweepFilter.max_elevation_deg > 0.0f &&
+                sweep.elevation_angle > m_archiveSweepFilter.max_elevation_deg)
+                continue;
+            if (!explicitTiltAllowed(m_archiveSweepFilter, sweep.elevation_angle))
+                continue;
+
+            uint32_t pointProductMask = 0;
+            if (usePoint) {
+                for (int p = 0; p < NUM_PRODUCTS; ++p) {
+                    const auto& pd = sweep.products[p];
+                    if (!pd.has_data)
+                        continue;
+                    if (gateIndexForRange(pd, rangeKm) >= 0)
+                        pointProductMask |= (1u << p);
+                }
+            } else {
+                pointProductMask = sweep.meta.product_mask;
+            }
+
+            if (usePoint && m_archiveSweepFilter.require_point_coverage && pointProductMask == 0)
+                continue;
+            if (m_archiveSweepFilter.require_active_product &&
+                ((pointProductMask & (1u << m_activeProduct)) == 0))
+                continue;
+
+            const float beamHeightM = usePoint
+                ? (float)beamHeightAboveRadarMeters(rangeKm, sweep.elevation_angle)
+                : 0.0f;
+            if (usePoint && m_archiveSweepFilter.max_beam_height_arl_m >= 0.0f &&
+                beamHeightM > m_archiveSweepFilter.max_beam_height_arl_m)
+                continue;
+
+            float azimuthError = 0.0f;
+            const int radialIdx = usePoint ? nearestRadialIndex(sweep, pointAzimuth, &azimuthError) : -1;
+            int64_t pointSampleEpoch = sweep.meta.sweep_display_epoch_ms;
+            if (usePoint &&
+                radialIdx >= 0 &&
+                sweep.meta.sweep_start_epoch_ms > 0 &&
+                radialIdx < (int)sweep.radial_time_offset_ms.size()) {
+                pointSampleEpoch = sweep.meta.sweep_start_epoch_ms + sweep.radial_time_offset_ms[radialIdx];
+            }
+            if (pointSampleEpoch <= 0) {
+                int64_t baseEpoch = 0;
+                if (frame->volume_start_epoch_ms > 0)
+                    baseEpoch = frame->volume_start_epoch_ms;
+                else if (frame->valid_time_epoch > 0)
+                    baseEpoch = frame->valid_time_epoch * 1000LL;
+                else
+                    baseEpoch = (int64_t)frameIdx * 60000LL;
+                pointSampleEpoch = baseEpoch + (int64_t)sweepIdx * 1000LL;
+            }
+
+            SweepFrameRef ref;
+            ref.volume_frame_index = frameIdx;
+            ref.sweep_index = sweepIdx;
+            ref.point_sample_epoch_ms = pointSampleEpoch;
+            ref.elevation_deg = sweep.elevation_angle;
+            ref.ground_range_km = rangeKm;
+            ref.point_azimuth_deg = pointAzimuth;
+            ref.beam_height_arl_m = beamHeightM;
+            ref.point_product_mask = pointProductMask;
+            ref.azimuth_error_deg = azimuthError;
+
+            char label[96];
+            if (usePoint) {
+                std::snprintf(label, sizeof(label), "%s | %.1f° | %.1f km",
+                              formatEpochMsUtc(pointSampleEpoch).c_str(),
+                              sweep.elevation_angle,
+                              beamHeightM / 1000.0f);
+            } else {
+                std::snprintf(label, sizeof(label), "%s | %.1f°",
+                              formatEpochMsUtc(pointSampleEpoch).c_str(),
+                              sweep.elevation_angle);
+            }
+            ref.label = label;
+            candidates.push_back(std::move(ref));
+        }
+    }
+
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](const SweepFrameRef& a, const SweepFrameRef& b) {
+                         if (a.point_sample_epoch_ms != b.point_sample_epoch_ms)
+                             return a.point_sample_epoch_ms < b.point_sample_epoch_ms;
+                         if (a.volume_frame_index != b.volume_frame_index)
+                             return a.volume_frame_index < b.volume_frame_index;
+                         return a.sweep_index < b.sweep_index;
+                     });
+
+    m_archiveSweepTimeline.frames =
+        smoothSweepCandidates(std::move(candidates), m_archiveSweepFilter.style, usePoint);
+
+    if (m_archiveSweepTimeline.frames.empty()) {
+        m_archiveSweepCursor = 0;
+        m_archiveSweepPlaying = false;
+        return;
+    }
+    m_archiveSweepCursor = std::clamp(m_archiveSweepCursor, 0,
+                                      std::max(0, (int)m_archiveSweepTimeline.frames.size() - 1));
+}
+
+void App::updateArchiveSweepPlayback(float dt) {
+    if (!archiveSweepStreamActive() || !m_archiveSweepPlaying || m_archiveSweepTimeline.frames.size() <= 1)
+        return;
+    const float fps = std::max(0.1f, m_historic.speed());
+    const float frameDur = 1.0f / fps;
+    m_archiveSweepAccumulator += dt;
+    while (m_archiveSweepAccumulator >= frameDur) {
+        m_archiveSweepAccumulator -= frameDur;
+        m_archiveSweepCursor = (m_archiveSweepCursor + 1) % (int)m_archiveSweepTimeline.frames.size();
+    }
+}
+
 TransportSnapshot App::transportSnapshot() const {
     TransportSnapshot snapshot;
     snapshot.archive_mode = m_historicMode;
     snapshot.snapshot_mode = m_snapshotMode;
     snapshot.review_enabled = m_liveLoopEnabled;
-    snapshot.playing = m_historicMode ? m_historic.playing() : m_liveLoopPlaying;
+    snapshot.playing = m_historicMode
+        ? (archiveSweepStreamActive() ? m_archiveSweepPlaying : m_historic.playing())
+        : m_liveLoopPlayIntent;
     snapshot.buffering = m_liveLoopBackfillLoading.load();
-    snapshot.requested_frames = m_historicMode ? std::max(1, m_historic.numFrames()) : m_liveLoopLength;
-    snapshot.ready_frames = m_historicMode ? m_historic.numFrames() : m_liveLoopCount;
-    snapshot.loading_frames = m_historicMode ? 0 :
+    snapshot.requested_frames = m_historicMode ? std::max(1, archiveFrameCount()) : m_liveLoopLength;
+    snapshot.ready_frames = m_historicMode ? archiveFrameCount() : m_liveLoopCount;
+    snapshot.loading_frames = m_historicMode
+        ? std::max(m_historic.totalFrames() - m_historic.downloadedFrames(), 0)
+        :
         std::max(m_liveLoopBackfillFetchTotal.load() - m_liveLoopBackfillFetchCompleted.load(), 0) +
         std::max(m_liveLoopBackfillQueueCount.load(), 0);
-    snapshot.cursor_frame = m_historicMode ? m_historic.currentFrame() : m_liveLoopPlaybackIndex;
-    snapshot.total_frames = m_historicMode ? m_historic.numFrames() : m_liveLoopCount;
+    snapshot.cursor_frame = m_historicMode
+        ? (archiveSweepStreamActive() ? m_archiveSweepCursor : m_historic.currentFrame())
+        : m_liveLoopPlaybackIndex;
+    snapshot.total_frames = m_historicMode ? archiveFrameCount() : m_liveLoopCount;
     snapshot.rate_fps = m_historicMode ? 0.0f : m_liveLoopSpeed;
-    snapshot.current_label = m_historicMode ? m_historic.currentLabel() :
+    snapshot.current_label = m_historicMode ? archiveCurrentLabel() :
         (m_snapshotMode ? m_snapshotLabel : liveLoopCurrentLabel());
     return snapshot;
 }
 
 void App::transportSetPlay(bool play) {
     if (m_historicMode) {
+        if (archiveSweepStreamActive()) {
+            m_archiveSweepPlaying = play;
+            m_archiveSweepAccumulator = 0.0f;
+            return;
+        }
         if (m_historic.playing() != play)
             m_historic.togglePlay();
         return;
     }
     if (!m_liveLoopEnabled && play)
         setLiveLoopEnabled(true);
-    if (m_liveLoopPlaying != play)
-        toggleLiveLoopPlayback();
+    m_liveLoopPlayIntent = play;
+    m_liveLoopPlaying = play && m_liveLoopCount > 1;
+    m_liveLoopAccumulator = 0.0f;
+    if (play && m_liveLoopCount <= 1)
+        requestLiveLoopBackfill();
 }
 
 void App::transportSeekFrame(int frameIndex) {
     if (m_historicMode) {
+        if (archiveSweepStreamActive()) {
+            m_archiveSweepCursor = std::clamp(frameIndex, 0, std::max(0, archiveFrameCount() - 1));
+            m_archiveSweepPlaying = false;
+            return;
+        }
         m_historic.setFrame(frameIndex);
         return;
     }
@@ -2885,6 +3341,12 @@ void App::transportSetRate(float fps) {
 
 void App::transportJumpLive() {
     if (m_historicMode) {
+        if (archiveSweepStreamActive()) {
+            const int total = archiveFrameCount();
+            if (total > 0)
+                m_archiveSweepCursor = total - 1;
+            return;
+        }
         const int total = m_historic.numFrames();
         if (total > 0)
             m_historic.setFrame(total - 1);
@@ -3659,7 +4121,7 @@ std::vector<StationUiState> App::stations() const {
 std::vector<WarningPolygon> App::currentWarnings() const {
     std::vector<WarningPolygon> source;
     if (m_historicMode) {
-        const RadarFrame* fr = m_historic.frame(m_historic.currentFrame());
+        const RadarFrame* fr = archiveFrameForTransportCursor();
         if (fr && !fr->valid_time_iso.empty())
             source = m_warnings.getHistoricWarnings(fr->valid_time_iso);
     } else if (m_snapshotMode && !m_snapshotTimestampIso.empty()) {
@@ -3814,7 +4276,7 @@ void App::rebuildVolumeForCurrentSelection() {
     };
 
     if (m_historicMode) {
-        const RadarFrame* fr = m_historic.frame(m_historic.currentFrame());
+        const RadarFrame* fr = archiveFrameForTransportCursor();
         if (fr && fr->ready && !fr->sweeps.empty())
             buildVolumeFromSweeps(fr->sweeps, fr->station_lat, fr->station_lon, 0);
         return;
@@ -3842,8 +4304,17 @@ void App::rebuildVolumeForCurrentSelection() {
 
 void App::refreshActiveTiltMetadata() {
     if (m_historicMode) {
-        const RadarFrame* fr = m_historic.frame(m_historic.currentFrame());
+        int sweepOverrideIdx = -1;
+        const RadarFrame* fr = archiveSweepStreamActive()
+            ? archiveFrameForTransportCursor(&sweepOverrideIdx)
+            : m_historic.frame(m_historic.currentFrame());
         if (!fr || !fr->ready || fr->sweeps.empty()) return;
+        if (archiveSweepStreamActive() && sweepOverrideIdx >= 0) {
+            m_maxTilts = 1;
+            m_activeTilt = 0;
+            m_activeTiltAngle = fr->sweeps[sweepOverrideIdx].elevation_angle;
+            return;
+        }
         int productTilts = countProductSweeps(fr->sweeps, m_activeProduct);
         if (productTilts <= 0) return;
         if (m_activeTilt >= productTilts) m_activeTilt = productTilts - 1;
@@ -3874,6 +4345,8 @@ void App::refreshActiveTiltMetadata() {
 
 int App::currentAvailableTilts() {
     if (m_historicMode) {
+        if (archiveSweepStreamActive())
+            return 1;
         const RadarFrame* fr = m_historic.frame(m_historic.currentFrame());
         if (!fr || !fr->ready || fr->sweeps.empty()) return 1;
         const int tilts = countProductSweeps(fr->sweeps, m_activeProduct);
@@ -4084,8 +4557,9 @@ bool App::ensurePanelCacheUpload(int paneIndex, int product, int tilt, float* ou
     const int slot = kPanelCacheSlotBase + paneIndex;
 
     if (m_historicMode) {
-        const int frameIdx = m_historic.currentFrame();
-        const RadarFrame* fr = m_historic.frame(frameIdx);
+        const int frameIdx = archiveSweepStreamActive() ? m_archiveSweepCursor : m_historic.currentFrame();
+        int sweepOverrideIdx = -1;
+        const RadarFrame* fr = archiveFrameForTransportCursor(&sweepOverrideIdx);
         if (!fr || !fr->ready || fr->sweeps.empty())
             return false;
 
@@ -4095,19 +4569,58 @@ bool App::ensurePanelCacheUpload(int paneIndex, int product, int tilt, float* ou
             cache.product == product &&
             cache.tilt == tilt) {
             if (outElevationAngle) {
-                const int productTilts = countProductSweeps(fr->sweeps, product);
-                if (productTilts > 0) {
-                    const int sweepIdx = findProductSweep(fr->sweeps, product,
-                                                          std::max(0, std::min(tilt, productTilts - 1)));
-                    if (sweepIdx >= 0)
-                        *outElevationAngle = fr->sweeps[sweepIdx].elevation_angle;
+                if (archiveSweepStreamActive() && sweepOverrideIdx >= 0 &&
+                    sweepOverrideIdx < (int)fr->sweeps.size()) {
+                    *outElevationAngle = fr->sweeps[sweepOverrideIdx].elevation_angle;
+                } else {
+                    const int productTilts = countProductSweeps(fr->sweeps, product);
+                    if (productTilts > 0) {
+                        const int sweepIdx = findProductSweep(fr->sweeps, product,
+                                                              std::max(0, std::min(tilt, productTilts - 1)));
+                        if (sweepIdx >= 0)
+                            *outElevationAngle = fr->sweeps[sweepIdx].elevation_angle;
+                    }
                 }
             }
             return true;
         }
 
-        if (!uploadSweepSetToSlot(slot, fr->sweeps, fr->station_lat, fr->station_lon,
-                                  product, tilt, outElevationAngle)) {
+        bool uploaded = false;
+        if (archiveSweepStreamActive() && sweepOverrideIdx >= 0 &&
+            sweepOverrideIdx < (int)fr->sweeps.size()) {
+            const auto& pc = fr->sweeps[sweepOverrideIdx];
+            if (pc.num_radials > 0 && pc.products[product].has_data) {
+                GpuStationInfo info = {};
+                info.lat = fr->station_lat;
+                info.lon = fr->station_lon;
+                info.elevation_angle = pc.elevation_angle;
+                info.num_radials = pc.num_radials;
+                const uint16_t* gatePtrs[NUM_PRODUCTS] = {};
+                for (int p = 0; p < NUM_PRODUCTS; ++p) {
+                    const auto& pd = pc.products[p];
+                    if (!pd.has_data)
+                        continue;
+                    info.has_product[p] = true;
+                    info.num_gates[p] = pd.num_gates;
+                    info.first_gate_km[p] = pd.first_gate_km;
+                    info.gate_spacing_km[p] = pd.gate_spacing_km;
+                    info.scale[p] = pd.scale;
+                    info.offset[p] = pd.offset;
+                    if (!pd.gates.empty())
+                        gatePtrs[p] = pd.gates.data();
+                }
+                gpu::allocateStation(slot, info);
+                gpu::uploadStationData(slot, info, pc.azimuths.data(), gatePtrs);
+                if (outElevationAngle)
+                    *outElevationAngle = pc.elevation_angle;
+                uploaded = true;
+            }
+        } else {
+            uploaded = uploadSweepSetToSlot(slot, fr->sweeps, fr->station_lat, fr->station_lon,
+                                            product, tilt, outElevationAngle);
+        }
+
+        if (!uploaded) {
             m_panelCacheStates[paneIndex] = {};
             return false;
         }
@@ -4283,17 +4796,37 @@ void App::updateLivePolling(std::chrono::steady_clock::time_point now) {
 void App::update(float dt) {
     // Historic mode: lock to event station, upload only on frame change
     if (m_historicMode) {
+        if (m_archiveProjectionKind == ArchiveProjectionKind::SweepStream &&
+            m_archiveSweepLastSourceCount != m_historic.downloadedFrames()) {
+            rebuildArchiveSweepTimeline();
+            m_lastHistoricFrame = -1;
+        }
         if (m_historic.downloadedFrames() > 0) {
-            m_historic.update(dt);
-            int curFrame = m_historic.currentFrame();
+            if (archiveSweepStreamActive()) {
+                updateArchiveSweepPlayback(dt);
+            } else {
+                m_historic.update(dt);
+            }
+            int curFrame = archiveSweepStreamActive() ? m_archiveSweepCursor : m_historic.currentFrame();
 
             // If current frame isn't ready, find nearest ready one
-            const RadarFrame* fr = m_historic.frame(curFrame);
+            int sweepIdx = -1;
+            const RadarFrame* fr = archiveFrameForTransportCursor(&sweepIdx);
             if (!fr || !fr->ready) {
                 for (int i = 0; i < m_historic.numFrames(); i++) {
                     if (m_historic.frame(i) && m_historic.frame(i)->ready) {
-                        curFrame = i;
-                        m_historic.setFrame(i);
+                        if (archiveSweepStreamActive()) {
+                            for (int j = 0; j < (int)m_archiveSweepTimeline.frames.size(); ++j) {
+                                if (m_archiveSweepTimeline.frames[j].volume_frame_index == i) {
+                                    curFrame = j;
+                                    m_archiveSweepCursor = j;
+                                    break;
+                                }
+                            }
+                        } else {
+                            curFrame = i;
+                            m_historic.setFrame(i);
+                        }
                         break;
                     }
                 }
@@ -4301,7 +4834,7 @@ void App::update(float dt) {
 
             // Only upload when frame actually changes
             if (curFrame != m_lastHistoricFrame) {
-                fr = m_historic.frame(curFrame);
+                fr = archiveFrameForTransportCursor(&sweepIdx);
                 if (fr && fr->ready) {
                     uploadHistoricFrame(curFrame);
                     if (!fr->valid_time_iso.empty())
@@ -4413,7 +4946,7 @@ void App::renderPane(int paneIndex, uint32_t* d_output) {
     }
 
     if (m_historicMode) {
-        const int currentFrame = m_historic.currentFrame();
+        const int currentFrame = archiveSweepStreamActive() ? m_archiveSweepCursor : m_historic.currentFrame();
         if (primaryPane && hasCachedFrame(currentFrame, gpuVp.width, gpuVp.height)) {
             CUDA_CHECK(cudaMemcpy(d_output, m_cachedFrames[currentFrame],
                                   (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t),
@@ -4430,8 +4963,12 @@ void App::renderPane(int paneIndex, uint32_t* d_output) {
         }
 
         const int slot = (primaryPane || canUsePrimarySlot) ? 0 : (kPanelCacheSlotBase + paneIndex);
+        int primarySweepIdx = -1;
+        const RadarFrame* currentArchiveFrame = archiveSweepStreamActive()
+            ? archiveFrameForTransportCursor(&primarySweepIdx)
+            : m_historic.frame(currentFrame);
         bool uploaded = primaryPane
-            ? (m_historic.frame(currentFrame) && m_historic.frame(currentFrame)->ready)
+            ? (currentArchiveFrame && currentArchiveFrame->ready)
             : (canUsePrimarySlot || ensurePanelCacheUpload(paneIndex, product, tilt));
         if (!uploaded) {
             CUDA_CHECK(cudaMemset(d_output, 0, (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t)));
@@ -4844,6 +5381,8 @@ void App::setProduct(int p) {
     m_needsRerender = true;
 
     if (m_historicMode) {
+        if (archiveSweepStreamActive() && m_archiveSweepFilter.require_active_product)
+            rebuildArchiveSweepTimeline();
         if (m_crossSection || m_mode3D)
             rebuildVolumeForCurrentSelection();
     } else {
@@ -4954,13 +5493,18 @@ void App::onMiddleDrag(double mx, double my) {
 void App::toggleCrossSection() {
     m_crossSection = !m_crossSection;
     invalidatePanelCaches();
+    ensureRenderTargets();
+    ensureCrossSectionBuffer(renderWidth(), std::max(200, renderHeight() / 3));
+    invalidateFrameCache(true);
+    m_needsComposite = true;
+    m_needsRerender = true;
     if (m_crossSection) {
         m_mode3D = false;
 
         // Position cross-section through the active station
         float slat = 0, slon = 0;
         if (m_historicMode) {
-            auto* fr = m_historic.frame(m_historic.currentFrame());
+            auto* fr = archiveFrameForTransportCursor();
             if (fr && fr->ready) { slat = fr->station_lat; slon = fr->station_lon; }
         } else if (m_activeStationIdx >= 0) {
             std::lock_guard<std::mutex> lock(m_stationMutex);
@@ -4973,9 +5517,6 @@ void App::toggleCrossSection() {
             m_xsEndLat = slat + 1.5f;
             m_xsEndLon = slon + 2.0f;
         }
-
-        ensureCrossSectionBuffer(m_windowWidth, std::max(200, m_windowHeight / 3));
-
         if (m_historicMode) {
             // Force re-upload of current historic frame, which will build the volume
             m_lastHistoricFrame = -1;
@@ -4990,6 +5531,11 @@ void App::toggle3D() {
     m_mode3D = !m_mode3D;
     m_showAll = false;
     invalidatePanelCaches();
+    ensureRenderTargets();
+    ensureCrossSectionBuffer(renderWidth(), std::max(200, renderHeight() / 3));
+    invalidateFrameCache(true);
+    m_needsComposite = true;
+    m_needsRerender = true;
     if (m_mode3D) {
         m_camera = {32.0f, 24.0f, 440.0f, 54.0f};
         rebuildVolumeForCurrentSelection();
@@ -5030,6 +5576,11 @@ void App::loadHistoricEvent(int idx) {
     m_snapshotLabel.clear();
     m_snapshotTimestampIso.clear();
     m_lastHistoricFrame = -1;
+    m_archiveSweepCursor = 0;
+    m_archiveSweepLastSourceCount = -1;
+    m_archiveSweepTimeline = {};
+    m_archiveSweepPlaying = false;
+    m_archiveSweepAccumulator = 0.0f;
     m_volumeBuilt = false;
     m_volumeStation = -1;
     invalidatePanelCaches();
@@ -5071,6 +5622,11 @@ bool App::loadArchiveRange(const std::string& station,
     m_snapshotLabel.clear();
     m_snapshotTimestampIso.clear();
     m_lastHistoricFrame = -1;
+    m_archiveSweepCursor = 0;
+    m_archiveSweepLastSourceCount = -1;
+    m_archiveSweepTimeline = {};
+    m_archiveSweepPlaying = false;
+    m_archiveSweepAccumulator = 0.0f;
     m_volumeBuilt = false;
     m_volumeStation = -1;
     invalidateFrameCache(true);
@@ -5088,20 +5644,31 @@ bool App::loadArchiveRange(const std::string& station,
 }
 
 void App::uploadHistoricFrame(int frameIdx) {
-    const RadarFrame* fr = m_historic.frame(frameIdx);
+    int sweepOverrideIdx = -1;
+    const RadarFrame* fr = archiveSweepStreamActive()
+        ? archiveFrameForTransportCursor(&sweepOverrideIdx)
+        : m_historic.frame(frameIdx);
     if (!fr || !fr->ready || fr->sweeps.empty()) return;
 
     int slot = 0;
-    // Filter by active product
-    int productTilts = countProductSweeps(fr->sweeps, m_activeProduct);
-    if (productTilts <= 0) {
-        gpu::freeStation(slot);
-        m_volumeBuilt = false;
-        m_volumeStation = -1;
-        return;
+    int productTilts = 1;
+    int sweepIdx = 0;
+    if (archiveSweepStreamActive() && sweepOverrideIdx >= 0) {
+        sweepIdx = sweepOverrideIdx;
+        m_maxTilts = 1;
+        m_activeTilt = 0;
+    } else {
+        int availableProductTilts = countProductSweeps(fr->sweeps, m_activeProduct);
+        if (availableProductTilts <= 0) {
+            gpu::freeStation(slot);
+            m_volumeBuilt = false;
+            m_volumeStation = -1;
+            return;
+        }
+        if (m_activeTilt >= availableProductTilts) m_activeTilt = availableProductTilts - 1;
+        productTilts = availableProductTilts;
+        sweepIdx = findProductSweep(fr->sweeps, m_activeProduct, m_activeTilt);
     }
-    if (m_activeTilt >= productTilts) m_activeTilt = productTilts - 1;
-    int sweepIdx = findProductSweep(fr->sweeps, m_activeProduct, m_activeTilt);
     auto& pc = fr->sweeps[sweepIdx];
     if (pc.num_radials == 0) return;
 
