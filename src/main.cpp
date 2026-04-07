@@ -86,7 +86,7 @@ static void windowSizeCallback(GLFWwindow* window, int width, int height) {
 }
 
 int main(int argc, char** argv) {
-    printf("=== CURSDAR3 - Radar Interrogation Console ===\n");
+    printf("=== PTX-RADAR - Radar Interrogation Console ===\n");
     printf("Loading next-generation shell on the CUDA radar engine\n\n");
 #ifdef _WIN32
     SetProcessDPIAware();
@@ -108,7 +108,7 @@ int main(int argc, char** argv) {
     int winW = mode->width;
     int winH = mode->height;
 
-    GLFWwindow* window = glfwCreateWindow(winW, winH, "CURSDAR3", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(winW, winH, "PTX-RADAR", nullptr, nullptr);
     if (!window) {
         fprintf(stderr, "Failed to create window\n");
         glfwTerminate();
@@ -222,7 +222,7 @@ int main(int argc, char** argv) {
             std::string activeStation = app.activeStationName();
             char title[144];
             snprintf(title, sizeof(title),
-                     "CURSDAR3 - %s | %s | Tilt %.1f | %d stations | %.0f FPS",
+                     "PTX-RADAR - %s | %s | Tilt %.1f | %d stations | %.0f FPS",
                      activeStation.c_str(),
                      PRODUCT_INFO[app.activeProduct()].name,
                      app.activeTiltAngle(),
@@ -379,6 +379,6 @@ int main(int argc, char** argv) {
     glfwDestroyWindow(window);
     glfwTerminate();
 
-    printf("CURSDAR3 shutdown complete.\n");
+    printf("PTX-RADAR shutdown complete.\n");
     return exitCode;
 }

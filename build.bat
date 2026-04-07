@@ -2,7 +2,7 @@
 setlocal
 cd /d %~dp0
 
-echo === CURSDAR3 Build ===
+echo === PTX-RADAR Build ===
 
 if exist "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" (
     call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=x64 >nul

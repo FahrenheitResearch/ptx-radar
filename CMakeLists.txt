@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(cursdar3 LANGUAGES C CXX CUDA)
+project(ptx-radar LANGUAGES C CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -91,7 +91,7 @@ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/ultra_kernels_ptx.h.in"
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/ultra_kernels.ptx")
 
-add_executable(cursdar3
+add_executable(ptx-radar
     src/main.cpp
     src/app.cpp
     src/historic.cpp
@@ -113,17 +113,17 @@ add_executable(cursdar3
     src/cuda/volume3d.cu
 )
 
-target_include_directories(cursdar3 PRIVATE
+target_include_directories(ptx-radar PRIVATE
     src
     "${CMAKE_CURRENT_BINARY_DIR}/generated"
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
 )
 
 if(WIN32)
-    target_compile_definitions(cursdar3 PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_definitions(ptx-radar PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 
-target_link_libraries(cursdar3 PRIVATE
+target_link_libraries(ptx-radar PRIVATE
     imgui
     glfw
     BZip2::BZip2
@@ -133,18 +133,18 @@ target_link_libraries(cursdar3 PRIVATE
 )
 
 if(WIN32)
-    target_link_libraries(cursdar3 PRIVATE opengl32 winhttp psapi ole32 windowscodecs)
+    target_link_libraries(ptx-radar PRIVATE opengl32 winhttp psapi ole32 windowscodecs)
 else()
     find_package(CURL REQUIRED)
-    target_link_libraries(cursdar3 PRIVATE GL CURL::libcurl dl pthread)
+    target_link_libraries(ptx-radar PRIVATE GL CURL::libcurl dl pthread)
 endif()
 
-set_target_properties(cursdar3 PROPERTIES
+set_target_properties(ptx-radar PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 
-target_compile_options(cursdar3 PRIVATE
+target_compile_options(ptx-radar PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
         --use_fast_math
         --expt-relaxed-constexpr
