@@ -10,6 +10,7 @@
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
 
+#include <cmath>
 #include <cstdio>
 #include <chrono>
 #include <thread>
@@ -21,6 +22,51 @@ static bool g_rightMouseDown = false;
 static bool g_middleMouseDown = false;
 static double g_lastMouseX = 0, g_lastMouseY = 0;
 static double g_leftMouseDownX = 0, g_leftMouseDownY = 0;
+
+// ── Global UI zoom (for remote desktop / phone use) ─────────
+// Plain  =  /  -   : zoom UI chrome+fonts in/out (10% steps, 60-300%)
+// Plain  0          : reset UI zoom to 100%
+// Shift+=  /  Shift+-  : chunky-pixel mode (drop radar render scale, 40-100%)
+// Shift+0           : reset chunky scale to 100%
+//
+// Plain hotkeys are suppressed while a text input is focused so they don't
+// stomp on typing in search boxes etc.
+static float       g_uiScale         = 1.0f;
+static float       g_appliedUiScale  = 1.0f;
+static ImGuiStyle  g_baseStyle;       // captured once after style setup
+static bool        g_baseStyleSaved  = false;
+static float       g_zoomHudTimer    = 0.0f;  // shows status for ~1.5s after change
+static const char* g_zoomHudKind     = "UI";
+
+static void applyUiScale(float scale) {
+    if (scale < 0.6f) scale = 0.6f;
+    if (scale > 3.0f) scale = 3.0f;
+    if (std::fabs(scale - g_appliedUiScale) < 0.005f) return;
+    if (!g_baseStyleSaved) return;
+
+    g_uiScale = scale;
+    g_appliedUiScale = scale;
+
+    // Reset style to baseline, then scale all paddings/borders/rounding.
+    ImGuiStyle& s = ImGui::GetStyle();
+    s = g_baseStyle;
+    s.ScaleAllSizes(scale);
+
+    // Scale all fonts via the global font scale.
+    ImGui::GetIO().FontGlobalScale = scale;
+
+    g_zoomHudTimer = 1.5f;
+    g_zoomHudKind  = "UI";
+}
+
+static void applyChunkyScale(App& app, float scale) {
+    if (scale < 0.4f) scale = 0.4f;
+    if (scale > 1.0f) scale = 1.0f;
+    if (std::fabs(scale - app.renderScale()) < 0.005f) return;
+    app.setRenderScale(scale);
+    g_zoomHudTimer = 1.5f;
+    g_zoomHudKind  = "Chunky";
+}
 
 static void scrollCallback(GLFWwindow* window, double xoff, double yoff) {
     if (ImGui::GetIO().WantCaptureMouse) return;
@@ -120,6 +166,11 @@ int main(int argc, char** argv) {
     ImGui_ImplOpenGL3_Init("#version 450");
 
     ui::init();
+
+    // Capture the post-init baseline style so UI scale changes are
+    // applied as a clean "rescale from base" instead of accumulating.
+    g_baseStyle = ImGui::GetStyle();
+    g_baseStyleSaved = true;
 
     int exitCode = 0;
 
@@ -241,7 +292,58 @@ int main(int argc, char** argv) {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
+        // Global zoom hotkeys (for phone-remote viewing).
+        //   plain  =/-/0           : UI zoom (chrome + fonts)
+        //   shift  =/-/0  (= +/_/) : chunky-pixel mode (lower radar render res)
+        // Suppressed while a text input has keyboard focus so they don't stomp
+        // on typing in search/inspector fields.
+        {
+            ImGuiIO& zio = ImGui::GetIO();
+            if (!zio.WantTextInput) {
+                const bool plus  = ImGui::IsKeyPressed(ImGuiKey_Equal, false) ||
+                                   ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, false);
+                const bool minus = ImGui::IsKeyPressed(ImGuiKey_Minus, false) ||
+                                   ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, false);
+                const bool zero  = ImGui::IsKeyPressed(ImGuiKey_0, false) ||
+                                   ImGui::IsKeyPressed(ImGuiKey_Keypad0, false);
+
+                if (zio.KeyShift) {
+                    if (plus)  applyChunkyScale(app, app.renderScale() + 0.1f);
+                    if (minus) applyChunkyScale(app, app.renderScale() - 0.1f);
+                    if (zero)  applyChunkyScale(app, 1.0f);
+                } else {
+                    if (plus)  applyUiScale(g_uiScale + 0.1f);
+                    if (minus) applyUiScale(g_uiScale - 0.1f);
+                    if (zero)  applyUiScale(1.0f);
+                }
+            }
+            if (g_zoomHudTimer > 0.0f)
+                g_zoomHudTimer -= dt;
+        }
+
         ui::render(app);
+
+        // Transient zoom-level HUD (~1.5s after a hotkey adjust)
+        if (g_zoomHudTimer > 0.0f) {
+            const ImGuiViewport* vp = ImGui::GetMainViewport();
+            ImVec2 center(vp->Pos.x + vp->Size.x * 0.5f,
+                          vp->Pos.y + vp->Size.y * 0.5f);
+            ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+            ImGui::SetNextWindowBgAlpha(0.55f);
+            ImGui::Begin("##zoomhud", nullptr,
+                         ImGuiWindowFlags_NoDecoration |
+                         ImGuiWindowFlags_NoMove |
+                         ImGuiWindowFlags_NoSavedSettings |
+                         ImGuiWindowFlags_NoFocusOnAppearing |
+                         ImGuiWindowFlags_NoNav |
+                         ImGuiWindowFlags_AlwaysAutoResize);
+            ImGui::Text("%s zoom  %d%%",
+                        g_zoomHudKind,
+                        (int)((g_zoomHudKind[0] == 'U' ? g_uiScale : app.renderScale())
+                              * 100.0f + 0.5f));
+            ImGui::TextDisabled("=/- UI    Shift +/- chunky    0 reset");
+            ImGui::End();
+        }
 
         // FPS overlay
         ImGui::SetNextWindowPos(ImVec2((float)app.viewport().width - 100, (float)app.viewport().height - 30));

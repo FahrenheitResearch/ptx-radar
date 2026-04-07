@@ -14,3 +14,9 @@ imgui.ini
 .vs/
 .idea/
 out/
+
+# Runtime / debug artifacts produced by the ultra-PTX work
+ultra_ptx_counts.log
+ultra_ptx_load.log
+cursdar3_stdout.log
+cursdar3_stderr.log

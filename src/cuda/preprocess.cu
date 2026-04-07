@@ -1,6 +1,9 @@
 #include "preprocess.cuh"
 #include "cuda_common.cuh"
+#include "ultra_ptx.h"
 #include <cuda_runtime.h>
+#include <cuda.h>
+#include <cstdio>
 #include <algorithm>
 #include <cmath>
 
@@ -38,10 +41,11 @@ __device__ float bestUnfoldedVelocity(float velocity, float reference, float nyq
     return best;
 }
 
-__global__ void dealiasVelocityKernel(const uint16_t* __restrict__ source,
-                                      uint16_t* __restrict__ corrected,
-                                      int nr, int ng,
-                                      float scale, float offset) {
+__global__ __launch_bounds__(256, 4)
+void dealiasVelocityKernel(const uint16_t* __restrict__ source,
+                           uint16_t* __restrict__ corrected,
+                           int nr, int ng,
+                           float scale, float offset) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = nr * ng;
     if (idx >= total) return;
@@ -150,9 +154,10 @@ __global__ void ringStatsKernel(const uint16_t* __restrict__ gates,
     suppress[gi] = (strongRing || looseRing) ? 1 : 0;
 }
 
-__global__ void zeroSuppressedGatesKernel(uint16_t* gates,
-                                          int nr, int ng,
-                                          const uint8_t* __restrict__ suppress) {
+__global__ __launch_bounds__(256, 8)
+void zeroSuppressedGatesKernel(uint16_t* gates,
+                               int nr, int ng,
+                               const uint8_t* __restrict__ suppress) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = nr * ng;
     if (idx >= total) return;
@@ -263,10 +268,33 @@ bool dealiasVelocity(PrecomputedSweep::ProductData& velPd, int numRadials,
         goto cleanup;
     }
 
-    dealiasVelocityKernel<<<grid, block, 0, stream>>>(
-        activeWorkspace->sourceGates(), activeWorkspace->correctedGates(),
-        numRadials, velPd.num_gates,
-        velPd.scale, velPd.offset);
+    {
+        bool used_ptx = false;
+        if (ultra_ptx::k_dealiasVelocityKernel && !ultra_ptx::g_disablePtx &&
+            !ultra_ptx::isKernelDisabled("dealiasVelocityKernel")) {
+            const uint16_t* src = activeWorkspace->sourceGates();
+            uint16_t* dst       = activeWorkspace->correctedGates();
+            int nr = numRadials;
+            int ng = velPd.num_gates;
+            float sc = velPd.scale;
+            float off = velPd.offset;
+            void* args[] = { (void*)&src, (void*)&dst, (void*)&nr, (void*)&ng,
+                             (void*)&sc, (void*)&off };
+            CUresult res = cuLaunchKernel(ultra_ptx::k_dealiasVelocityKernel,
+                                          (unsigned)grid, 1, 1,
+                                          (unsigned)block, 1, 1,
+                                          0, stream, args, nullptr);
+            if (res == CUDA_SUCCESS) used_ptx = true;
+            else fprintf(stderr, "[ultra-ptx] dealiasVelocity launch failed: %s\n",
+                         ultra_ptx::err_str(res));
+        }
+        if (!used_ptx) {
+            dealiasVelocityKernel<<<grid, block, 0, stream>>>(
+                activeWorkspace->sourceGates(), activeWorkspace->correctedGates(),
+                numRadials, velPd.num_gates,
+                velPd.scale, velPd.offset);
+        }
+    }
     if (cudaGetLastError() != cudaSuccess)
         goto cleanup;
 
@@ -315,16 +343,59 @@ bool suppressReflectivityRings(std::vector<PrecomputedSweep>& sweeps,
             goto cleanup;
         }
 
-        ringStatsKernel<<<pd.num_gates, 256, 0, stream>>>(
-            activeWorkspace->sourceGates(), sweep.num_radials, pd.num_gates,
-            pd.scale, pd.offset, pd.first_gate_km, pd.gate_spacing_km,
-            activeWorkspace->suppressMask());
+        {
+            bool used_ptx = false;
+            if (ultra_ptx::k_ringStatsKernel && !ultra_ptx::g_disablePtx &&
+                !ultra_ptx::isKernelDisabled("ringStatsKernel")) {
+                const uint16_t* src = activeWorkspace->sourceGates();
+                int nr = sweep.num_radials;
+                int ng = pd.num_gates;
+                float sc = pd.scale, off = pd.offset;
+                float fg = pd.first_gate_km, gs = pd.gate_spacing_km;
+                uint8_t* sm = activeWorkspace->suppressMask();
+                void* args[] = { (void*)&src, (void*)&nr, (void*)&ng,
+                                 (void*)&sc, (void*)&off,
+                                 (void*)&fg, (void*)&gs, (void*)&sm };
+                CUresult res = cuLaunchKernel(ultra_ptx::k_ringStatsKernel,
+                                              (unsigned)pd.num_gates, 1, 1,
+                                              256, 1, 1, 0, stream, args, nullptr);
+                if (res == CUDA_SUCCESS) used_ptx = true;
+                else fprintf(stderr, "[ultra-ptx] ringStats launch failed: %s\n",
+                             ultra_ptx::err_str(res));
+            }
+            if (!used_ptx) {
+                ringStatsKernel<<<pd.num_gates, 256, 0, stream>>>(
+                    activeWorkspace->sourceGates(), sweep.num_radials, pd.num_gates,
+                    pd.scale, pd.offset, pd.first_gate_km, pd.gate_spacing_km,
+                    activeWorkspace->suppressMask());
+            }
+        }
         if (cudaGetLastError() != cudaSuccess)
             goto cleanup;
 
-        zeroSuppressedGatesKernel<<<grid, block, 0, stream>>>(
-            activeWorkspace->sourceGates(), sweep.num_radials, pd.num_gates,
-            activeWorkspace->suppressMask());
+        {
+            bool used_ptx = false;
+            if (ultra_ptx::k_zeroSuppressedGatesKernel && !ultra_ptx::g_disablePtx &&
+                !ultra_ptx::isKernelDisabled("zeroSuppressedGatesKernel")) {
+                uint16_t* g = activeWorkspace->sourceGates();
+                int nr = sweep.num_radials;
+                int ng = pd.num_gates;
+                const uint8_t* sm = activeWorkspace->suppressMask();
+                void* args[] = { (void*)&g, (void*)&nr, (void*)&ng, (void*)&sm };
+                CUresult res = cuLaunchKernel(ultra_ptx::k_zeroSuppressedGatesKernel,
+                                              (unsigned)grid, 1, 1,
+                                              (unsigned)block, 1, 1,
+                                              0, stream, args, nullptr);
+                if (res == CUDA_SUCCESS) used_ptx = true;
+                else fprintf(stderr, "[ultra-ptx] zeroSuppressedGates launch failed: %s\n",
+                             ultra_ptx::err_str(res));
+            }
+            if (!used_ptx) {
+                zeroSuppressedGatesKernel<<<grid, block, 0, stream>>>(
+                    activeWorkspace->sourceGates(), sweep.num_radials, pd.num_gates,
+                    activeWorkspace->suppressMask());
+            }
+        }
         if (cudaGetLastError() != cudaSuccess)
             goto cleanup;
 

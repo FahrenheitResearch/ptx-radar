@@ -630,6 +630,15 @@ private:
     AlertSelectionState m_selectedAlert;
 
 public:
+    // Chunky render-scale control. 1.0 = native resolution. Lower values
+    // (down to 0.4) render the radar at reduced resolution and let the GL
+    // texture stretch back to full panel size, producing chunky pixels that
+    // are easier to read on a phone-remote session. Used by the global zoom
+    // hotkey in main.cpp.
+    float renderScale() const { return m_renderScale; }
+    void  setRenderScale(float scale);
+
+public:
     // NWS warning overlay
     WarningFetcher m_warnings;
     WarningRenderOptions m_warningOptions;

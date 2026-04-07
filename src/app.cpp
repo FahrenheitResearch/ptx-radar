@@ -1760,6 +1760,26 @@ int App::panelRenderHeight(int index) const {
     return std::max(1, (int)std::lround((double)rect.height * m_renderScale));
 }
 
+void App::setRenderScale(float scale) {
+    if (scale < 0.4f) scale = 0.4f;
+    if (scale > 1.0f) scale = 1.0f;
+    if (std::fabs(scale - m_renderScale) < 0.005f) return;
+    m_renderScale = scale;
+    m_memoryTelemetry.render_scale = m_renderScale;
+
+    // Reallocate render targets at the new resolution and force a full
+    // re-render so the next frame uses the new chunky size.
+    ensureRenderTargets();
+    ensureCrossSectionBuffer(renderWidth(), std::max(200, renderHeight() / 3));
+    invalidateFrameCache(true);
+    m_volumeBuilt = false;
+    m_volumeStation = -1;
+    m_needsComposite = true;
+    m_needsRerender = true;
+    if (m_mode3D || m_crossSection)
+        rebuildVolumeForCurrentSelection();
+}
+
 GlCudaTexture& App::panelTexture(int index) {
     if (index <= 0)
         return m_outputTex;
@@ -5891,10 +5911,14 @@ void App::render() {
     if (m_gridDirty)
         buildSpatialGrid();
 
+    // The kernel launches and the texture-array memcpy in updateFromDevice()
+    // both run on the default stream, so they serialize naturally without an
+    // explicit cudaDeviceSynchronize between panes. Removing the sync lets the
+    // CPU queue all panes in one shot and continue to the next render stage
+    // (cross-section, telemetry, ImGui draw) while the GPU is still busy.
     const int paneCount = panelRenderCount();
     for (int pane = 0; pane < paneCount; ++pane) {
         renderPane(pane, m_d_compositeOutput);
-        CUDA_CHECK(cudaDeviceSynchronize());
         panelTexture(pane).updateFromDevice(m_d_compositeOutput,
                                             panelRenderWidth(pane), panelRenderHeight(pane));
     }

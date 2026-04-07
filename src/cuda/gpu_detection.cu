@@ -1,6 +1,9 @@
 #include "gpu_detection.cuh"
 #include "cuda_common.cuh"
+#include "ultra_ptx.h"
 
+#include <cuda.h>
+#include <cstdio>
 #include <cmath>
 
 namespace gpu_detection {
@@ -32,7 +35,8 @@ bool copyDeviceVector(std::vector<T>& out, const T* src, size_t count) {
     return cudaSuccessOnly(cudaMemcpy(out.data(), src, count * sizeof(T), cudaMemcpyDeviceToHost));
 }
 
-__global__ void tdsCandidateKernel(const float* __restrict__ ref,
+__global__ __launch_bounds__(256, 4)
+void tdsCandidateKernel(const float* __restrict__ ref,
                                    const float* __restrict__ ref_mask,
                                    const float* __restrict__ zdr,
                                    const float* __restrict__ zdr_mask,
@@ -68,7 +72,8 @@ __global__ void tdsCandidateKernel(const float* __restrict__ ref,
     score[idx] = cc_v;
 }
 
-__global__ void hailCandidateKernel(const float* __restrict__ ref,
+__global__ __launch_bounds__(256, 4)
+void hailCandidateKernel(const float* __restrict__ ref,
                                     const float* __restrict__ ref_mask,
                                     const float* __restrict__ zdr,
                                     const float* __restrict__ zdr_mask,
@@ -141,7 +146,8 @@ __device__ bool passesMesoGate(const float* vel,
     return true;
 }
 
-__global__ void mesoCandidateKernel(const float* __restrict__ ref,
+__global__ __launch_bounds__(256, 4)
+void mesoCandidateKernel(const float* __restrict__ ref,
                                     const float* __restrict__ ref_mask,
                                     const float* __restrict__ vel,
                                     const float* __restrict__ vel_mask,
@@ -203,7 +209,8 @@ __global__ void mesoCandidateKernel(const float* __restrict__ ref,
     diameter[idx] = az_span_km;
 }
 
-__global__ void supportExtremumKernel(const uint8_t* __restrict__ mask,
+__global__ __launch_bounds__(256, 4)
+void supportExtremumKernel(const uint8_t* __restrict__ mask,
                                       const float* __restrict__ score,
                                       int num_radials,
                                       int num_gates,
@@ -256,7 +263,8 @@ __global__ void supportExtremumKernel(const uint8_t* __restrict__ mask,
     keep[idx] = support >= min_support ? 1 : 0;
 }
 
-__global__ void compactCandidatesKernel(const uint8_t* __restrict__ keep,
+__global__ __launch_bounds__(256, 8)
+void compactCandidatesKernel(const uint8_t* __restrict__ keep,
                                         const float* __restrict__ score,
                                         const float* __restrict__ aux,
                                         int num_radials,
@@ -275,6 +283,99 @@ __global__ void compactCandidatesKernel(const uint8_t* __restrict__ keep,
     out[slot].gate_idx = gate_idx;
     out[slot].score = score[idx];
     out[slot].aux = aux ? aux[idx] : 0.0f;
+}
+
+// ── Hand-PTX launchers ──────────────────────────────────────
+// Each helper tries the loaded ultra-ptx kernel first; if its handle is
+// null (PTX failed to load that entry) or cuLaunchKernel returns an error
+// it falls through to the nvcc-compiled kernel below.
+
+inline void launchTds(int grid, int block, cudaStream_t stream,
+                      const float* ref, const float* refMask,
+                      const float* zdr, const float* zdrMask,
+                      const float* cc,  const float* ccMask,
+                      int nr, int ng, float fg, float gs,
+                      uint8_t* mask, float* score) {
+    if (ultra_ptx::k_tdsCandidateKernel && !ultra_ptx::g_disablePtx &&
+        !ultra_ptx::isKernelDisabled("tdsCandidateKernel")) {
+        void* args[] = { (void*)&ref, (void*)&refMask, (void*)&zdr, (void*)&zdrMask,
+                         (void*)&cc, (void*)&ccMask, (void*)&nr, (void*)&ng,
+                         (void*)&fg, (void*)&gs, (void*)&mask, (void*)&score };
+        if (cuLaunchKernel(ultra_ptx::k_tdsCandidateKernel,
+                           (unsigned)grid, 1, 1, (unsigned)block, 1, 1,
+                           0, stream, args, nullptr) == CUDA_SUCCESS) return;
+    }
+    tdsCandidateKernel<<<grid, block, 0, stream>>>(
+        ref, refMask, zdr, zdrMask, cc, ccMask, nr, ng, fg, gs, mask, score);
+}
+
+inline void launchHail(int grid, int block, cudaStream_t stream,
+                       const float* ref, const float* refMask,
+                       const float* zdr, const float* zdrMask,
+                       int nr, int ng, float fg, float gs,
+                       uint8_t* mask, float* score) {
+    if (ultra_ptx::k_hailCandidateKernel && !ultra_ptx::g_disablePtx &&
+        !ultra_ptx::isKernelDisabled("hailCandidateKernel")) {
+        void* args[] = { (void*)&ref, (void*)&refMask, (void*)&zdr, (void*)&zdrMask,
+                         (void*)&nr, (void*)&ng, (void*)&fg, (void*)&gs,
+                         (void*)&mask, (void*)&score };
+        if (cuLaunchKernel(ultra_ptx::k_hailCandidateKernel,
+                           (unsigned)grid, 1, 1, (unsigned)block, 1, 1,
+                           0, stream, args, nullptr) == CUDA_SUCCESS) return;
+    }
+    hailCandidateKernel<<<grid, block, 0, stream>>>(
+        ref, refMask, zdr, zdrMask, nr, ng, fg, gs, mask, score);
+}
+
+inline void launchMeso(int grid, int block, cudaStream_t stream,
+                       const float* ref, const float* refMask,
+                       const float* vel, const float* velMask, bool hasRef,
+                       int nr, int ng, float fg, float gs,
+                       uint8_t* mask, float* score, float* diameter) {
+    if (ultra_ptx::k_mesoCandidateKernel && !ultra_ptx::g_disablePtx &&
+        !ultra_ptx::isKernelDisabled("mesoCandidateKernel")) {
+        void* args[] = { (void*)&ref, (void*)&refMask, (void*)&vel, (void*)&velMask,
+                         (void*)&hasRef, (void*)&nr, (void*)&ng, (void*)&fg, (void*)&gs,
+                         (void*)&mask, (void*)&score, (void*)&diameter };
+        if (cuLaunchKernel(ultra_ptx::k_mesoCandidateKernel,
+                           (unsigned)grid, 1, 1, (unsigned)block, 1, 1,
+                           0, stream, args, nullptr) == CUDA_SUCCESS) return;
+    }
+    mesoCandidateKernel<<<grid, block, 0, stream>>>(
+        ref, refMask, vel, velMask, hasRef, nr, ng, fg, gs, mask, score, diameter);
+}
+
+inline void launchSupport(int grid, int block, cudaStream_t stream,
+                          const uint8_t* maskIn, const float* scoreIn,
+                          int nr, int ng, int rRad, int gRad, int minSup,
+                          bool lowerBetter, uint8_t* keepOut) {
+    if (ultra_ptx::k_supportExtremumKernel && !ultra_ptx::g_disablePtx &&
+        !ultra_ptx::isKernelDisabled("supportExtremumKernel")) {
+        void* args[] = { (void*)&maskIn, (void*)&scoreIn, (void*)&nr, (void*)&ng,
+                         (void*)&rRad, (void*)&gRad, (void*)&minSup,
+                         (void*)&lowerBetter, (void*)&keepOut };
+        if (cuLaunchKernel(ultra_ptx::k_supportExtremumKernel,
+                           (unsigned)grid, 1, 1, (unsigned)block, 1, 1,
+                           0, stream, args, nullptr) == CUDA_SUCCESS) return;
+    }
+    supportExtremumKernel<<<grid, block, 0, stream>>>(
+        maskIn, scoreIn, nr, ng, rRad, gRad, minSup, lowerBetter, keepOut);
+}
+
+inline void launchCompact(int grid, int block, cudaStream_t stream,
+                          const uint8_t* keepIn, const float* scoreIn, const float* aux,
+                          int nr, int ng, CompactCandidate* outArr, int* outCount) {
+    if (ultra_ptx::k_compactCandidatesKernel && !ultra_ptx::g_disablePtx &&
+        !ultra_ptx::isKernelDisabled("compactCandidatesKernel")) {
+        void* args[] = { (void*)&keepIn, (void*)&scoreIn, (void*)&aux,
+                         (void*)&nr, (void*)&ng,
+                         (void*)&outArr, (void*)&outCount };
+        if (cuLaunchKernel(ultra_ptx::k_compactCandidatesKernel,
+                           (unsigned)grid, 1, 1, (unsigned)block, 1, 1,
+                           0, stream, args, nullptr) == CUDA_SUCCESS) return;
+    }
+    compactCandidatesKernel<<<grid, block, 0, stream>>>(
+        keepIn, scoreIn, aux, nr, ng, outArr, outCount);
 }
 
 } // namespace
@@ -411,55 +512,55 @@ bool CandidateWorkspace::compute(const gpu_tensor::PolarTensor& tensor,
     const int grid = (int)((cellCount + block - 1) / block);
 
     if (hasRef && hasZdr && hasCc) {
-        tdsCandidateKernel<<<grid, block, 0, stream>>>(
-            ref, refMask, zdr, zdrMask, cc, ccMask,
-            tensor.spec.num_radials, tensor.spec.num_gates,
-            tensor.spec.first_gate_km, tensor.spec.gate_spacing_km,
-            m_d_tdsMask, m_d_tdsScore);
-        supportExtremumKernel<<<grid, block, 0, stream>>>(
-            m_d_tdsMask, m_d_tdsScore,
-            tensor.spec.num_radials, tensor.spec.num_gates,
-            2, 2, 6, true, m_d_tdsKeep);
-        compactCandidatesKernel<<<grid, block, 0, stream>>>(
-            m_d_tdsKeep, m_d_tdsScore, nullptr,
-            tensor.spec.num_radials, tensor.spec.num_gates,
-            m_d_tdsCandidates, m_d_tdsCount);
+        launchTds(grid, block, stream,
+                  ref, refMask, zdr, zdrMask, cc, ccMask,
+                  tensor.spec.num_radials, tensor.spec.num_gates,
+                  tensor.spec.first_gate_km, tensor.spec.gate_spacing_km,
+                  m_d_tdsMask, m_d_tdsScore);
+        launchSupport(grid, block, stream,
+                      m_d_tdsMask, m_d_tdsScore,
+                      tensor.spec.num_radials, tensor.spec.num_gates,
+                      2, 2, 6, true, m_d_tdsKeep);
+        launchCompact(grid, block, stream,
+                      m_d_tdsKeep, m_d_tdsScore, nullptr,
+                      tensor.spec.num_radials, tensor.spec.num_gates,
+                      m_d_tdsCandidates, m_d_tdsCount);
         if (cudaGetLastError() != cudaSuccess)
             return false;
     }
 
     if (hasRef && hasZdr) {
-        hailCandidateKernel<<<grid, block, 0, stream>>>(
-            ref, refMask, zdr, zdrMask,
-            tensor.spec.num_radials, tensor.spec.num_gates,
-            tensor.spec.first_gate_km, tensor.spec.gate_spacing_km,
-            m_d_hailMask, m_d_hailScore);
-        supportExtremumKernel<<<grid, block, 0, stream>>>(
-            m_d_hailMask, m_d_hailScore,
-            tensor.spec.num_radials, tensor.spec.num_gates,
-            2, 2, 5, false, m_d_hailKeep);
-        compactCandidatesKernel<<<grid, block, 0, stream>>>(
-            m_d_hailKeep, m_d_hailScore, nullptr,
-            tensor.spec.num_radials, tensor.spec.num_gates,
-            m_d_hailCandidates, m_d_hailCount);
+        launchHail(grid, block, stream,
+                   ref, refMask, zdr, zdrMask,
+                   tensor.spec.num_radials, tensor.spec.num_gates,
+                   tensor.spec.first_gate_km, tensor.spec.gate_spacing_km,
+                   m_d_hailMask, m_d_hailScore);
+        launchSupport(grid, block, stream,
+                      m_d_hailMask, m_d_hailScore,
+                      tensor.spec.num_radials, tensor.spec.num_gates,
+                      2, 2, 5, false, m_d_hailKeep);
+        launchCompact(grid, block, stream,
+                      m_d_hailKeep, m_d_hailScore, nullptr,
+                      tensor.spec.num_radials, tensor.spec.num_gates,
+                      m_d_hailCandidates, m_d_hailCount);
         if (cudaGetLastError() != cudaSuccess)
             return false;
     }
 
     if (hasVel) {
-        mesoCandidateKernel<<<grid, block, 0, stream>>>(
-            ref, refMask, vel, velMask, hasRef,
-            tensor.spec.num_radials, tensor.spec.num_gates,
-            tensor.spec.first_gate_km, tensor.spec.gate_spacing_km,
-            m_d_mesoMask, m_d_mesoScore, m_d_mesoDiameter);
-        supportExtremumKernel<<<grid, block, 0, stream>>>(
-            m_d_mesoMask, m_d_mesoScore,
-            tensor.spec.num_radials, tensor.spec.num_gates,
-            2, 1, 3, false, m_d_mesoKeep);
-        compactCandidatesKernel<<<grid, block, 0, stream>>>(
-            m_d_mesoKeep, m_d_mesoScore, m_d_mesoDiameter,
-            tensor.spec.num_radials, tensor.spec.num_gates,
-            m_d_mesoCandidates, m_d_mesoCount);
+        launchMeso(grid, block, stream,
+                   ref, refMask, vel, velMask, hasRef,
+                   tensor.spec.num_radials, tensor.spec.num_gates,
+                   tensor.spec.first_gate_km, tensor.spec.gate_spacing_km,
+                   m_d_mesoMask, m_d_mesoScore, m_d_mesoDiameter);
+        launchSupport(grid, block, stream,
+                      m_d_mesoMask, m_d_mesoScore,
+                      tensor.spec.num_radials, tensor.spec.num_gates,
+                      2, 1, 3, false, m_d_mesoKeep);
+        launchCompact(grid, block, stream,
+                      m_d_mesoKeep, m_d_mesoScore, m_d_mesoDiameter,
+                      tensor.spec.num_radials, tensor.spec.num_gates,
+                      m_d_mesoCandidates, m_d_mesoCount);
         if (cudaGetLastError() != cudaSuccess)
             return false;
     }

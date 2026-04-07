@@ -1,4 +1,6 @@
 #include "volume3d.cuh"
+#include "ultra_ptx.h"
+#include <cuda.h>
 #include <cstdio>
 #include <cmath>
 #include <vector>
@@ -219,7 +221,8 @@ __device__ float sampleVolumeDensityTex(cudaTextureObject_t volTex,
     return sampleVolumeDensity(product, sample.x, sample.y, threshold);
 }
 
-__global__ void buildVolumeKernel(float2* __restrict__ volume, int product) {
+__global__ __launch_bounds__(64, 8)
+void buildVolumeKernel(float2* __restrict__ volume, int product) {
     int vx = blockIdx.x * blockDim.x + threadIdx.x;
     int vy = blockIdx.y * blockDim.y + threadIdx.y;
     int vz = blockIdx.z;
@@ -301,9 +304,10 @@ __global__ void buildVolumeKernel(float2* __restrict__ volume, int product) {
     volume[(size_t)vz * VOL_XY * VOL_XY + vy * VOL_XY + vx] = out;
 }
 
-__global__ void smoothVolumeKernel(const float2* __restrict__ src,
-                                   float2* __restrict__ dst,
-                                   int product) {
+__global__ __launch_bounds__(64, 8)
+void smoothVolumeKernel(const float2* __restrict__ src,
+                        float2* __restrict__ dst,
+                        int product) {
     int vx = blockIdx.x * blockDim.x + threadIdx.x;
     int vy = blockIdx.y * blockDim.y + threadIdx.y;
     int vz = blockIdx.z;
@@ -384,7 +388,8 @@ __global__ void smoothVolumeKernel(const float2* __restrict__ src,
     dst[idx] = make_float2(out_val, out_cov);
 }
 
-__global__ void rayMarchKernel(
+__global__ __launch_bounds__(256, 4)
+void rayMarchKernel(
     cudaTextureObject_t volTex,
     float cam_x, float cam_y, float cam_z,
     float fwd_x, float fwd_y, float fwd_z,
@@ -604,7 +609,8 @@ __global__ void rayMarchKernel(
                                      (uint8_t)(fb * 255.0f));
 }
 
-__global__ void crossSectionKernel(
+__global__ __launch_bounds__(256, 4)
+void crossSectionKernel(
     float start_x_km, float start_y_km,
     float dir_x, float dir_y,
     float total_dist_km,
@@ -790,15 +796,56 @@ void buildVolume(int station_idx, int product,
 
     CUDA_CHECK(cudaMemcpyToSymbol(c_sweeps, h_sweeps.data(), count * sizeof(SweepDesc)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_numSweeps, &count, sizeof(int)));
+    // Mirror to the hand-PTX module's constant memory so ultra_buildVolume /
+    // ultra_smoothVolume / ultra_crossSection see the same sweep table.
+    ultra_ptx::uploadConstSweeps(h_sweeps.data(), count * sizeof(SweepDesc));
+    ultra_ptx::uploadConstNumSweeps(count);
 
-    dim3 block(8, 8);
-    dim3 grid((VOL_XY + 7) / 8, (VOL_XY + 7) / 8, VOL_Z);
-    buildVolumeKernel<<<grid, block>>>(d_volume_raw, product);
+    const unsigned bx = 8, by = 8;
+    const unsigned gx = (VOL_XY + bx - 1) / bx;
+    const unsigned gy = (VOL_XY + by - 1) / by;
+    const unsigned gz = VOL_Z;
+
+    {
+        bool used_ptx = false;
+        if (ultra_ptx::k_buildVolumeKernel && !ultra_ptx::g_disablePtx &&
+            !ultra_ptx::isKernelDisabled("buildVolumeKernel")) {
+            float2* vol = d_volume_raw;
+            int prod = product;
+            void* args[] = { (void*)&vol, (void*)&prod };
+            CUresult res = cuLaunchKernel(ultra_ptx::k_buildVolumeKernel,
+                                          gx, gy, gz, bx, by, 1,
+                                          0, 0, args, nullptr);
+            if (res == CUDA_SUCCESS) used_ptx = true;
+            else fprintf(stderr, "[ultra-ptx] buildVolume launch failed: %s\n",
+                         ultra_ptx::err_str(res));
+        }
+        if (!used_ptx) {
+            dim3 block(bx, by);
+            dim3 grid(gx, gy, gz);
+            buildVolumeKernel<<<grid, block>>>(d_volume_raw, product);
+        }
+    }
     for (int pass = 0; pass < s_volumeQuality.smooth_passes; ++pass) {
-        smoothVolumeKernel<<<grid, block>>>(
-            (pass & 1) ? d_volume_scratch : d_volume_raw,
-            (pass & 1) ? d_volume_raw : d_volume_scratch,
-            product);
+        const float2* src = (pass & 1) ? d_volume_scratch : d_volume_raw;
+        float2*       dst = (pass & 1) ? d_volume_raw : d_volume_scratch;
+        bool used_ptx = false;
+        if (ultra_ptx::k_smoothVolumeKernel && !ultra_ptx::g_disablePtx &&
+            !ultra_ptx::isKernelDisabled("smoothVolumeKernel")) {
+            int prod = product;
+            void* args[] = { (void*)&src, (void*)&dst, (void*)&prod };
+            CUresult res = cuLaunchKernel(ultra_ptx::k_smoothVolumeKernel,
+                                          gx, gy, gz, bx, by, 1,
+                                          0, 0, args, nullptr);
+            if (res == CUDA_SUCCESS) used_ptx = true;
+            else fprintf(stderr, "[ultra-ptx] smoothVolume launch failed: %s\n",
+                         ultra_ptx::err_str(res));
+        }
+        if (!used_ptx) {
+            dim3 block(bx, by);
+            dim3 grid(gx, gy, gz);
+            smoothVolumeKernel<<<grid, block>>>(src, dst, product);
+        }
     }
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -857,19 +904,51 @@ void renderVolume(const Camera3D& cam, int width, int height,
     float uy = rz * fx - rx * fz;
     float uz = rx * fy - ry * fx;
 
-    dim3 block(16, 16);
-    dim3 grid((width + 15) / 16, (height + 15) / 16);
+    const unsigned bx = 16, by = 16;
+    const unsigned gx = (width + bx - 1) / bx;
+    const unsigned gy = (height + by - 1) / by;
 
-    rayMarchKernel<<<grid, block>>>(
-        d_volume_tex,
-        cx, cy, cz,
-        fx, fy, fz,
-        rx, ry, rz,
-        ux, uy, uz,
-        0.62f, width, height, product, dbz_min,
-        s_volumeQuality.ray_step_km,
-        s_volumeQuality.max_steps,
-        d_output);
+    bool used_ptx = false;
+    if (ultra_ptx::k_rayMarchKernel && !ultra_ptx::g_disablePtx &&
+        !ultra_ptx::isKernelDisabled("rayMarchKernel")) {
+        cudaTextureObject_t tex = d_volume_tex;
+        float cx_l=cx, cy_l=cy, cz_l=cz;
+        float fx_l=fx, fy_l=fy, fz_l=fz;
+        float rx_l=rx, ry_l=ry, rz_l=rz;
+        float ux_l=ux, uy_l=uy, uz_l=uz;
+        float fov = 0.62f;
+        int   w = width, h = height, p = product;
+        float dbz = dbz_min;
+        float step = s_volumeQuality.ray_step_km;
+        int   maxs = s_volumeQuality.max_steps;
+        uint32_t* out = d_output;
+        void* args[] = {
+            (void*)&tex,
+            (void*)&cx_l, (void*)&cy_l, (void*)&cz_l,
+            (void*)&fx_l, (void*)&fy_l, (void*)&fz_l,
+            (void*)&rx_l, (void*)&ry_l, (void*)&rz_l,
+            (void*)&ux_l, (void*)&uy_l, (void*)&uz_l,
+            (void*)&fov, (void*)&w, (void*)&h, (void*)&p,
+            (void*)&dbz, (void*)&step, (void*)&maxs,
+            (void*)&out,
+        };
+        CUresult res = cuLaunchKernel(ultra_ptx::k_rayMarchKernel,
+                                      gx, gy, 1, bx, by, 1,
+                                      0, 0, args, nullptr);
+        if (res == CUDA_SUCCESS) used_ptx = true;
+        else fprintf(stderr, "[ultra-ptx] rayMarch launch failed: %s\n",
+                     ultra_ptx::err_str(res));
+    }
+    if (!used_ptx) {
+        dim3 block(bx, by);
+        dim3 grid(gx, gy);
+        rayMarchKernel<<<grid, block>>>(
+            d_volume_tex,
+            cx, cy, cz, fx, fy, fz, rx, ry, rz, ux, uy, uz,
+            0.62f, width, height, product, dbz_min,
+            s_volumeQuality.ray_step_km, s_volumeQuality.max_steps,
+            d_output);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -896,16 +975,43 @@ void renderCrossSection(
     float nx = ddx / total;
     float ny = ddy / total;
 
-    dim3 block(16, 16);
-    dim3 grid((width + 15) / 16, (height + 15) / 16);
+    const unsigned bx = 16, by = 16;
+    const unsigned gx = (width  + bx - 1) / bx;
+    const unsigned gy = (height + by - 1) / by;
 
-    crossSectionKernel<<<grid, block>>>(
-        sx_km, sy_km,
-        nx, ny,
-        total,
-        width, height,
-        product, dbz_min,
-        d_output);
+    bool used_ptx = false;
+    if (ultra_ptx::k_crossSectionKernel && !ultra_ptx::g_disablePtx &&
+        !ultra_ptx::isKernelDisabled("crossSectionKernel")) {
+        float sxk = sx_km, syk = sy_km;
+        float nxc = nx, nyc = ny, tot = total;
+        int   w = width, h = height, p = product;
+        float dbz = dbz_min;
+        uint32_t* out = d_output;
+        void* args[] = {
+            (void*)&sxk, (void*)&syk,
+            (void*)&nxc, (void*)&nyc, (void*)&tot,
+            (void*)&w,   (void*)&h,
+            (void*)&p,   (void*)&dbz,
+            (void*)&out,
+        };
+        CUresult res = cuLaunchKernel(ultra_ptx::k_crossSectionKernel,
+                                      gx, gy, 1, bx, by, 1,
+                                      0, 0, args, nullptr);
+        if (res == CUDA_SUCCESS) used_ptx = true;
+        else fprintf(stderr, "[ultra-ptx] crossSection launch failed: %s\n",
+                     ultra_ptx::err_str(res));
+    }
+    if (!used_ptx) {
+        dim3 block(bx, by);
+        dim3 grid(gx, gy);
+        crossSectionKernel<<<grid, block>>>(
+            sx_km, sy_km,
+            nx, ny,
+            total,
+            width, height,
+            product, dbz_min,
+            d_output);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

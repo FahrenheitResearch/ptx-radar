@@ -1,6 +1,9 @@
 #include "gpu_tensor.cuh"
 #include "cuda_common.cuh"
+#include "ultra_ptx.h"
 
+#include <cuda.h>
+#include <cstdio>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -83,9 +86,10 @@ __device__ bool sampleRange(const KernelSweepInput& input,
     return false;
 }
 
-__global__ void generateUniformAzimuthsKernel(float* outAzimuths,
-                                              int count,
-                                              float offsetDeg) {
+__global__ __launch_bounds__(256, 8)
+void generateUniformAzimuthsKernel(float* outAzimuths,
+                                   int count,
+                                   float offsetDeg) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count)
         return;
@@ -94,10 +98,11 @@ __global__ void generateUniformAzimuthsKernel(float* outAzimuths,
     outAzimuths[idx] = wrapAzimuth(offsetDeg + step * (float)idx);
 }
 
-__global__ void buildRadialMapKernel(const float* sourceAzimuths,
-                                     int numSourceRadials,
-                                     const float* targetAzimuths,
-                                     int numTargetRadials,
+__global__ __launch_bounds__(256, 4)
+void buildRadialMapKernel(const float* sourceAzimuths,
+                          int numSourceRadials,
+                          const float* targetAzimuths,
+                          int numTargetRadials,
                                      int* outLo,
                                      int* outHi,
                                      float* outWeight,
@@ -173,9 +178,10 @@ __global__ void buildRadialMapKernel(const float* sourceAzimuths,
     outWeight[idx] = weight;
 }
 
-__global__ void buildGateMapKernel(int numSourceGates,
-                                   float sourceFirstGateKm,
-                                   float sourceGateSpacingKm,
+__global__ __launch_bounds__(256, 4)
+void buildGateMapKernel(int numSourceGates,
+                        float sourceFirstGateKm,
+                        float sourceGateSpacingKm,
                                    int numTargetGates,
                                    float targetFirstGateKm,
                                    float targetGateSpacingKm,
@@ -223,12 +229,13 @@ __global__ void buildGateMapKernel(int numSourceGates,
     outWeight[idx] = fminf(fmaxf(weight, 0.0f), 1.0f);
 }
 
-__global__ void buildTensorKernel(const KernelSweepInput* inputs,
-                                  const int* const* radialLoPtrs,
-                                  const int* const* radialHiPtrs,
-                                  const float* const* radialWeightPtrs,
-                                  const int* const* gateLoPtrs,
-                                  const int* const* gateHiPtrs,
+__global__ __launch_bounds__(256, 4)
+void buildTensorKernel(const KernelSweepInput* inputs,
+                       const int* const* radialLoPtrs,
+                       const int* const* radialHiPtrs,
+                       const float* const* radialWeightPtrs,
+                       const int* const* gateLoPtrs,
+                       const int* const* gateHiPtrs,
                                   const float* const* gateWeightPtrs,
                                   TensorSpec spec,
                                   float* outTensor,
@@ -590,8 +597,25 @@ bool TensorWorkspace::build(const SweepInput inputs[NUM_TENSOR_PRODUCTS],
     if ((spec.flags & TENSOR_TARGET_UNIFORM_AZIMUTH) != 0 || spec.num_radials != base.num_radials) {
         const int threads = 256;
         const int blocks = (spec.num_radials + threads - 1) / threads;
-        generateUniformAzimuthsKernel<<<blocks, threads, 0, m_stream>>>(
-            m_d_targetAzimuths, spec.num_radials, spec.azimuth_offset_deg);
+        bool used_ptx = false;
+        if (ultra_ptx::k_generateUniformAzimuthsKernel && !ultra_ptx::g_disablePtx &&
+            !ultra_ptx::isKernelDisabled("generateUniformAzimuthsKernel")) {
+            float* az_arg = m_d_targetAzimuths;
+            int n_arg = spec.num_radials;
+            float off_arg = spec.azimuth_offset_deg;
+            void* args[] = { (void*)&az_arg, (void*)&n_arg, (void*)&off_arg };
+            CUresult res = cuLaunchKernel(ultra_ptx::k_generateUniformAzimuthsKernel,
+                                          (unsigned)blocks, 1, 1,
+                                          (unsigned)threads, 1, 1,
+                                          0, m_stream, args, nullptr);
+            if (res == CUDA_SUCCESS) used_ptx = true;
+            else fprintf(stderr, "[ultra-ptx] generateUniformAzimuths launch failed: %s\n",
+                         ultra_ptx::err_str(res));
+        }
+        if (!used_ptx) {
+            generateUniformAzimuthsKernel<<<blocks, threads, 0, m_stream>>>(
+                m_d_targetAzimuths, spec.num_radials, spec.azimuth_offset_deg);
+        }
     } else {
         if (!cudaSuccessOnly(cudaMemcpyAsync(m_d_targetAzimuths, base.h_azimuths,
                                              (size_t)spec.num_radials * sizeof(float),
@@ -612,25 +636,74 @@ bool TensorWorkspace::build(const SweepInput inputs[NUM_TENSOR_PRODUCTS],
         {
             const int threads = 256;
             const int blocks = (spec.num_radials + threads - 1) / threads;
-            buildRadialMapKernel<<<blocks, threads, 0, m_stream>>>(
-                m_inputs[slot].d_azimuths, inputs[slot].num_radials,
-                m_d_targetAzimuths, spec.num_radials,
-                m_radialMaps[slot].d_lo, m_radialMaps[slot].d_hi,
-                m_radialMaps[slot].d_weight, linearAzimuth);
+            bool used_ptx = false;
+            if (ultra_ptx::k_buildRadialMapKernel && !ultra_ptx::g_disablePtx &&
+                !ultra_ptx::isKernelDisabled("buildRadialMapKernel")) {
+                const float* sa = m_inputs[slot].d_azimuths;
+                int snr = inputs[slot].num_radials;
+                const float* ta = m_d_targetAzimuths;
+                int tnr = spec.num_radials;
+                int* lo = m_radialMaps[slot].d_lo;
+                int* hi = m_radialMaps[slot].d_hi;
+                float* w = m_radialMaps[slot].d_weight;
+                bool lin = linearAzimuth;
+                void* args[] = { (void*)&sa, (void*)&snr, (void*)&ta, (void*)&tnr,
+                                 (void*)&lo, (void*)&hi, (void*)&w, (void*)&lin };
+                CUresult res = cuLaunchKernel(ultra_ptx::k_buildRadialMapKernel,
+                                              (unsigned)blocks, 1, 1,
+                                              (unsigned)threads, 1, 1,
+                                              0, m_stream, args, nullptr);
+                if (res == CUDA_SUCCESS) used_ptx = true;
+                else fprintf(stderr, "[ultra-ptx] buildRadialMap launch failed: %s\n",
+                             ultra_ptx::err_str(res));
+            }
+            if (!used_ptx) {
+                buildRadialMapKernel<<<blocks, threads, 0, m_stream>>>(
+                    m_inputs[slot].d_azimuths, inputs[slot].num_radials,
+                    m_d_targetAzimuths, spec.num_radials,
+                    m_radialMaps[slot].d_lo, m_radialMaps[slot].d_hi,
+                    m_radialMaps[slot].d_weight, linearAzimuth);
+            }
         }
 
         {
             const int threads = 256;
             const int blocks = (spec.num_gates + threads - 1) / threads;
-            buildGateMapKernel<<<blocks, threads, 0, m_stream>>>(
-                inputs[slot].num_gates,
-                inputs[slot].first_gate_km,
-                inputs[slot].gate_spacing_km,
-                spec.num_gates,
-                spec.first_gate_km,
-                spec.gate_spacing_km,
-                m_gateMaps[slot].d_lo, m_gateMaps[slot].d_hi,
-                m_gateMaps[slot].d_weight, linearRange);
+            bool used_ptx = false;
+            if (ultra_ptx::k_buildGateMapKernel && !ultra_ptx::g_disablePtx &&
+                !ultra_ptx::isKernelDisabled("buildGateMapKernel")) {
+                int sng = inputs[slot].num_gates;
+                float sfg = inputs[slot].first_gate_km;
+                float sgs = inputs[slot].gate_spacing_km;
+                int tng = spec.num_gates;
+                float tfg = spec.first_gate_km;
+                float tgs = spec.gate_spacing_km;
+                int* lo = m_gateMaps[slot].d_lo;
+                int* hi = m_gateMaps[slot].d_hi;
+                float* w = m_gateMaps[slot].d_weight;
+                bool lin = linearRange;
+                void* args[] = { (void*)&sng, (void*)&sfg, (void*)&sgs,
+                                 (void*)&tng, (void*)&tfg, (void*)&tgs,
+                                 (void*)&lo, (void*)&hi, (void*)&w, (void*)&lin };
+                CUresult res = cuLaunchKernel(ultra_ptx::k_buildGateMapKernel,
+                                              (unsigned)blocks, 1, 1,
+                                              (unsigned)threads, 1, 1,
+                                              0, m_stream, args, nullptr);
+                if (res == CUDA_SUCCESS) used_ptx = true;
+                else fprintf(stderr, "[ultra-ptx] buildGateMap launch failed: %s\n",
+                             ultra_ptx::err_str(res));
+            }
+            if (!used_ptx) {
+                buildGateMapKernel<<<blocks, threads, 0, m_stream>>>(
+                    inputs[slot].num_gates,
+                    inputs[slot].first_gate_km,
+                    inputs[slot].gate_spacing_km,
+                    spec.num_gates,
+                    spec.first_gate_km,
+                    spec.gate_spacing_km,
+                    m_gateMaps[slot].d_lo, m_gateMaps[slot].d_hi,
+                    m_gateMaps[slot].d_weight, linearRange);
+            }
         }
     }
 
@@ -662,14 +735,43 @@ bool TensorWorkspace::build(const SweepInput inputs[NUM_TENSOR_PRODUCTS],
     }
 
     {
-        dim3 block(16, 16);
-        dim3 grid((spec.num_radials + block.x - 1) / block.x,
-                  (spec.num_gates + block.y - 1) / block.y);
-        buildTensorKernel<<<grid, block, 0, m_stream>>>(
-            static_cast<const KernelSweepInput*>(m_d_inputs),
-            m_d_radialLoPtrs, m_d_radialHiPtrs, m_d_radialWeightPtrs,
-            m_d_gateLoPtrs, m_d_gateHiPtrs, m_d_gateWeightPtrs,
-            spec, m_d_tensor, validMask);
+        const unsigned bx = 16, by = 16;
+        const unsigned gx = (spec.num_radials + bx - 1) / bx;
+        const unsigned gy = (spec.num_gates + by - 1) / by;
+        bool used_ptx = false;
+        if (ultra_ptx::k_buildTensorKernel && !ultra_ptx::g_disablePtx &&
+            !ultra_ptx::isKernelDisabled("buildTensorKernel")) {
+            const KernelSweepInput* in = static_cast<const KernelSweepInput*>(m_d_inputs);
+            const int* const* rlo = m_d_radialLoPtrs;
+            const int* const* rhi = m_d_radialHiPtrs;
+            const float* const* rw = m_d_radialWeightPtrs;
+            const int* const* glo = m_d_gateLoPtrs;
+            const int* const* ghi = m_d_gateHiPtrs;
+            const float* const* gw = m_d_gateWeightPtrs;
+            TensorSpec sp = spec;       // byval struct
+            float* out = m_d_tensor;
+            uint32_t mask = validMask;
+            void* args[] = {
+                (void*)&in, (void*)&rlo, (void*)&rhi, (void*)&rw,
+                (void*)&glo, (void*)&ghi, (void*)&gw,
+                (void*)&sp, (void*)&out, (void*)&mask,
+            };
+            CUresult res = cuLaunchKernel(ultra_ptx::k_buildTensorKernel,
+                                          gx, gy, 1, bx, by, 1,
+                                          0, m_stream, args, nullptr);
+            if (res == CUDA_SUCCESS) used_ptx = true;
+            else fprintf(stderr, "[ultra-ptx] buildTensor launch failed: %s\n",
+                         ultra_ptx::err_str(res));
+        }
+        if (!used_ptx) {
+            dim3 block(bx, by);
+            dim3 grid(gx, gy);
+            buildTensorKernel<<<grid, block, 0, m_stream>>>(
+                static_cast<const KernelSweepInput*>(m_d_inputs),
+                m_d_radialLoPtrs, m_d_radialHiPtrs, m_d_radialWeightPtrs,
+                m_d_gateLoPtrs, m_d_gateHiPtrs, m_d_gateWeightPtrs,
+                spec, m_d_tensor, validMask);
+        }
     }
 
     if (!cudaSuccessOnly(cudaGetLastError()) ||

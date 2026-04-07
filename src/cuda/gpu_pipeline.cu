@@ -1,5 +1,7 @@
 #include "gpu_pipeline.cuh"
 #include "../nexrad/level2.h"
+#include "ultra_ptx.h"
+#include <cuda.h>
 #include <cstdio>
 #include <algorithm>
 #include <array>
@@ -279,7 +281,8 @@ __global__ void parseMsg31Kernel(
 // Scans raw data for valid MSG31 positions at 2432-byte boundaries
 // and variable offsets.
 
-__global__ void findMessageOffsetsKernel(
+__global__ __launch_bounds__(256, 4)
+void findMessageOffsetsKernel(
     const uint8_t* __restrict__ raw,
     size_t raw_size,
     int* __restrict__ offsets_out,
@@ -301,7 +304,8 @@ __global__ void findMessageOffsetsKernel(
 }
 
 // Second pass: find messages at variable offsets (between 2432-byte boundaries)
-__global__ void findVariableOffsetsKernel(
+__global__ __launch_bounds__(256, 4)
+void findVariableOffsetsKernel(
     const uint8_t* __restrict__ raw,
     size_t raw_size,
     const int* __restrict__ aligned_offsets,
@@ -338,10 +342,11 @@ __global__ void findVariableOffsetsKernel(
 // the offset stored in the parsed radial info, writes to
 // gate-major output buffer.
 
-__global__ void scanSweepMetadataKernel(const GpuParsedRadial* __restrict__ radials,
-                                        int num_radials,
-                                        uint32_t* __restrict__ lowest_key,
-                                        uint32_t* __restrict__ sweep_bits) {
+__global__ __launch_bounds__(256, 4)
+void scanSweepMetadataKernel(const GpuParsedRadial* __restrict__ radials,
+                             int num_radials,
+                             uint32_t* __restrict__ lowest_key,
+                             uint32_t* __restrict__ sweep_bits) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_radials)
         return;
@@ -360,11 +365,12 @@ __global__ void scanSweepMetadataKernel(const GpuParsedRadial* __restrict__ radi
     atomicMin(lowest_key, key);
 }
 
-__global__ void collectLowestSweepIndicesKernel(const GpuParsedRadial* __restrict__ radials,
-                                                int num_radials,
-                                                int lowest_elev_num,
-                                                int* __restrict__ indices_out,
-                                                int* __restrict__ count_out) {
+__global__ __launch_bounds__(256, 4)
+void collectLowestSweepIndicesKernel(const GpuParsedRadial* __restrict__ radials,
+                                     int num_radials,
+                                     int lowest_elev_num,
+                                     int* __restrict__ indices_out,
+                                     int* __restrict__ count_out) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_radials)
         return;
@@ -379,11 +385,12 @@ __global__ void collectLowestSweepIndicesKernel(const GpuParsedRadial* __restric
     indices_out[slot] = idx;
 }
 
-__global__ void collectSweepIndicesKernel(const GpuParsedRadial* __restrict__ radials,
-                                          int num_radials,
-                                          int elevation_number,
-                                          int* __restrict__ indices_out,
-                                          int* __restrict__ count_out) {
+__global__ __launch_bounds__(256, 4)
+void collectSweepIndicesKernel(const GpuParsedRadial* __restrict__ radials,
+                               int num_radials,
+                               int elevation_number,
+                               int* __restrict__ indices_out,
+                               int* __restrict__ count_out) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_radials)
         return;
@@ -398,6 +405,11 @@ __global__ void collectSweepIndicesKernel(const GpuParsedRadial* __restrict__ ra
     indices_out[slot] = idx;
 }
 
+// Serial per-product metadata selector -- restored to the original upstream
+// behaviour because the parallel rewrite below was producing different
+// metadata that broke dBZ colormapping for some volumes. Used by the nvcc
+// fallback path. The parallel version is kept because the hand-PTX module
+// still loads it (matching the nvcc PTX that was extracted).
 __global__ void selectProductMetaKernel(const GpuParsedRadial* __restrict__ radials,
                                         const int* __restrict__ radial_indices,
                                         int num_radials,
@@ -420,6 +432,60 @@ __global__ void selectProductMetaKernel(const GpuParsedRadial* __restrict__ radi
     meta_out[product] = best;
 }
 
+__global__ __launch_bounds__(256, 4)
+void selectProductMetaAllKernel(const GpuParsedRadial* __restrict__ radials,
+                                const int* __restrict__ radial_indices,
+                                int num_radials,
+                                DeviceProductMeta* __restrict__ meta_out) {
+    const int product = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int blockSize = blockDim.x;
+
+    int local_best_gates = 0;
+    int local_best_idx = -1;
+
+    for (int i = tid; i < num_radials; i += blockSize) {
+        int ri = radial_indices[i];
+        const GpuParsedRadial& r = radials[ri];
+        if (r.moment_offsets[product] < 0 || r.num_gates[product] <= 0)
+            continue;
+        if (r.num_gates[product] > local_best_gates) {
+            local_best_gates = r.num_gates[product];
+            local_best_idx = ri;
+        }
+    }
+
+    __shared__ int s_gates[256];
+    __shared__ int s_idx[256];
+    s_gates[tid] = local_best_gates;
+    s_idx[tid] = local_best_idx;
+    __syncthreads();
+
+    for (int stride = blockSize >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            if (s_gates[tid + stride] > s_gates[tid]) {
+                s_gates[tid] = s_gates[tid + stride];
+                s_idx[tid]   = s_idx[tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        DeviceProductMeta best = {};
+        if (s_idx[0] >= 0) {
+            const GpuParsedRadial& r = radials[s_idx[0]];
+            best.has_product   = 1;
+            best.num_gates     = r.num_gates[product];
+            best.first_gate    = r.first_gate[product];
+            best.gate_spacing  = r.gate_spacing[product];
+            best.scale         = r.scale[product];
+            best.offset        = r.offset[product];
+        }
+        meta_out[product] = best;
+    }
+}
+
 struct RadialIndexByAzimuth {
     const GpuParsedRadial* radials = nullptr;
 
@@ -428,7 +494,8 @@ struct RadialIndexByAzimuth {
     }
 };
 
-__global__ void transposeKernel(
+__global__ __launch_bounds__(256, 4)
+void transposeKernel(
     const uint8_t* __restrict__ raw_data,
     const GpuParsedRadial* __restrict__ radials,
     const int* __restrict__ radial_indices, // sorted indices by azimuth
@@ -462,7 +529,8 @@ __global__ void transposeKernel(
 }
 
 // Extract sorted azimuths kernel
-__global__ void extractAzimuthsKernel(
+__global__ __launch_bounds__(256, 8)
+void extractAzimuthsKernel(
     const GpuParsedRadial* __restrict__ radials,
     const int* __restrict__ radial_indices,
     int num_radials,
@@ -499,8 +567,19 @@ bool buildSweepResult(const uint8_t* d_raw,
 
     const int summaryBlocks = (num_parsed + 255) / 256;
     CUDA_CHECK(cudaMemsetAsync(scratch.d_selected_count, 0, sizeof(int), activeStream));
-    collectSweepIndicesKernel<<<summaryBlocks, 256, 0, activeStream>>>(
-        d_radials, num_parsed, elevation_number, scratch.d_indices, scratch.d_selected_count);
+    {
+        const GpuParsedRadial* r = d_radials;
+        int n = num_parsed; int e = elevation_number;
+        int* idx = scratch.d_indices; int* cnt = scratch.d_selected_count;
+        void* args[] = { (void*)&r, (void*)&n, (void*)&e, (void*)&idx, (void*)&cnt };
+        if (!ultra_ptx::tryLaunch(ultra_ptx::k_collectSweepIndicesKernel,
+                                  (unsigned)summaryBlocks, 1, 1, 256, 1, 1,
+                                  0, activeStream, args, "collectSweepIndices")) {
+            collectSweepIndicesKernel<<<summaryBlocks, 256, 0, activeStream>>>(
+                d_radials, num_parsed, elevation_number,
+                scratch.d_indices, scratch.d_selected_count);
+        }
+    }
     CUDA_CHECK(cudaGetLastError());
 
     CUDA_CHECK(cudaMemcpyAsync(&result.num_radials, scratch.d_selected_count, sizeof(int),
@@ -528,9 +607,22 @@ bool buildSweepResult(const uint8_t* d_raw,
 
     CUDA_CHECK(cudaMemsetAsync(scratch.d_product_meta, 0,
                                NUM_PRODUCTS * sizeof(DeviceProductMeta), activeStream));
-    for (int p = 0; p < NUM_PRODUCTS; ++p) {
-        selectProductMetaKernel<<<1, 1, 0, activeStream>>>(
-            d_radials, scratch.d_indices, result.num_radials, p, scratch.d_product_meta);
+    {
+        const GpuParsedRadial* r = d_radials;
+        const int* idx = scratch.d_indices;
+        int n = result.num_radials;
+        DeviceProductMeta* m = scratch.d_product_meta;
+        void* args[] = { (void*)&r, (void*)&idx, (void*)&n, (void*)&m };
+        if (!ultra_ptx::tryLaunch(ultra_ptx::k_selectProductMetaAllKernel,
+                                  NUM_PRODUCTS, 1, 1, 256, 1, 1,
+                                  0, activeStream, args, "selectProductMetaAll")) {
+            // Serial per-product fallback (matches original upstream behaviour).
+            for (int p = 0; p < NUM_PRODUCTS; ++p) {
+                selectProductMetaKernel<<<1, 1, 0, activeStream>>>(
+                    d_radials, scratch.d_indices, result.num_radials, p,
+                    scratch.d_product_meta);
+            }
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 
@@ -587,8 +679,20 @@ int parseOnGpu(const uint8_t* d_raw_data, size_t raw_size,
     int num_potential = (int)(raw_size / 2432) + 1;
     int threads = 256;
     int blocks = (num_potential + threads - 1) / threads;
-    findMessageOffsetsKernel<<<blocks, threads, 0, activeStream>>>(
-        d_raw_data, raw_size, scratch.d_offsets, scratch.d_count, max_radials);
+    {
+        const uint8_t* raw = d_raw_data;
+        size_t rsz = raw_size;
+        int* off = scratch.d_offsets;
+        int* cnt = scratch.d_count;
+        int  mx  = max_radials;
+        void* args[] = { (void*)&raw, (void*)&rsz, (void*)&off, (void*)&cnt, (void*)&mx };
+        if (!ultra_ptx::tryLaunch(ultra_ptx::k_findMessageOffsetsKernel,
+                                  (unsigned)blocks, 1, 1, (unsigned)threads, 1, 1,
+                                  0, activeStream, args, "findMessageOffsets")) {
+            findMessageOffsetsKernel<<<blocks, threads, 0, activeStream>>>(
+                d_raw_data, raw_size, scratch.d_offsets, scratch.d_count, max_radials);
+        }
+    }
 
     // Get count from pass 1
     int h_count = 0;
@@ -599,9 +703,25 @@ int parseOnGpu(const uint8_t* d_raw_data, size_t raw_size,
     if (h_count > 0) {
         const int aligned_count = (h_count > max_radials) ? max_radials : h_count;
         // Pass 2: find variable-offset messages
-        findVariableOffsetsKernel<<<(aligned_count + 255) / 256, 256, 0, activeStream>>>(
-            d_raw_data, raw_size, scratch.d_offsets, aligned_count,
-            scratch.d_offsets, scratch.d_count, max_radials);
+        {
+            const uint8_t* raw = d_raw_data;
+            size_t rsz = raw_size;
+            const int* aligned = scratch.d_offsets;
+            int ac = aligned_count;
+            int* off_out = scratch.d_offsets;
+            int* cnt_out = scratch.d_count;
+            int mx = max_radials;
+            void* args[] = { (void*)&raw, (void*)&rsz, (void*)&aligned, (void*)&ac,
+                             (void*)&off_out, (void*)&cnt_out, (void*)&mx };
+            if (!ultra_ptx::tryLaunch(ultra_ptx::k_findVariableOffsetsKernel,
+                                      (unsigned)((aligned_count + 255) / 256), 1, 1,
+                                      256, 1, 1,
+                                      0, activeStream, args, "findVariableOffsets")) {
+                findVariableOffsetsKernel<<<(aligned_count + 255) / 256, 256, 0, activeStream>>>(
+                    d_raw_data, raw_size, scratch.d_offsets, aligned_count,
+                    scratch.d_offsets, scratch.d_count, max_radials);
+            }
+        }
 
         CUDA_CHECK(cudaMemcpyAsync(&h_count, scratch.d_count, sizeof(int),
                                     cudaMemcpyDeviceToHost, activeStream));
@@ -620,8 +740,20 @@ int parseOnGpu(const uint8_t* d_raw_data, size_t raw_size,
     thrust::sort(thrust::cuda::par.on(activeStream), d_off_ptr, d_off_ptr + h_count);
 
     // Parse all found messages
-    parseMsg31Kernel<<<(h_count + 255) / 256, 256, 0, activeStream>>>(
-        d_raw_data, raw_size, scratch.d_offsets, h_count, d_radials_out);
+    {
+        const uint8_t* raw = d_raw_data;
+        size_t rsz = raw_size;
+        const int* off = scratch.d_offsets;
+        int n = h_count;
+        GpuParsedRadial* out = d_radials_out;
+        void* args[] = { (void*)&raw, (void*)&rsz, (void*)&off, (void*)&n, (void*)&out };
+        if (!ultra_ptx::tryLaunch(ultra_ptx::k_parseMsg31Kernel,
+                                  (unsigned)((h_count + 255) / 256), 1, 1, 256, 1, 1,
+                                  0, activeStream, args, "parseMsg31")) {
+            parseMsg31Kernel<<<(h_count + 255) / 256, 256, 0, activeStream>>>(
+                d_raw_data, raw_size, scratch.d_offsets, h_count, d_radials_out);
+        }
+    }
     return h_count;
 }
 
@@ -650,15 +782,41 @@ void transposeGatesGpu(
                                stream));
 
     // Launch transpose kernel
-    dim3 block(32, 8);
-    dim3 grid((out_num_gates + 31) / 32, (num_output_radials + 7) / 8);
-    transposeKernel<<<grid, block, 0, stream>>>(
-        d_raw_data, d_radials, d_radial_indices, num_output_radials,
-        product, d_output, out_num_gates);
+    {
+        const unsigned bx = 32, by = 8;
+        const unsigned gx = (out_num_gates + bx - 1) / bx;
+        const unsigned gy = (num_output_radials + by - 1) / by;
+        const uint8_t* raw = d_raw_data;
+        const GpuParsedRadial* r = d_radials;
+        const int* idx = d_radial_indices;
+        int n = num_output_radials, p = product, ng = out_num_gates;
+        uint16_t* out = d_output;
+        void* args[] = { (void*)&raw, (void*)&r, (void*)&idx, (void*)&n,
+                         (void*)&p, (void*)&out, (void*)&ng };
+        if (!ultra_ptx::tryLaunch(ultra_ptx::k_transposeKernel,
+                                  gx, gy, 1, bx, by, 1,
+                                  0, stream, args, "transpose")) {
+            transposeKernel<<<dim3(gx, gy), dim3(bx, by), 0, stream>>>(
+                d_raw_data, d_radials, d_radial_indices, num_output_radials,
+                product, d_output, out_num_gates);
+        }
+    }
 
     // Extract sorted azimuths
-    extractAzimuthsKernel<<<(num_output_radials + 255) / 256, 256, 0, stream>>>(
-        d_radials, d_radial_indices, num_output_radials, d_azimuths_out);
+    {
+        const unsigned blocks = (num_output_radials + 255) / 256;
+        const GpuParsedRadial* r = d_radials;
+        const int* idx = d_radial_indices;
+        int n = num_output_radials;
+        float* out = d_azimuths_out;
+        void* args[] = { (void*)&r, (void*)&idx, (void*)&n, (void*)&out };
+        if (!ultra_ptx::tryLaunch(ultra_ptx::k_extractAzimuthsKernel,
+                                  blocks, 1, 1, 256, 1, 1,
+                                  0, stream, args, "extractAzimuths")) {
+            extractAzimuthsKernel<<<blocks, 256, 0, stream>>>(
+                d_radials, d_radial_indices, num_output_radials, d_azimuths_out);
+        }
+    }
 }
 
 // ── Full ingest pipeline ────────────────────────────────────
@@ -694,8 +852,19 @@ GpuIngestResult ingestSweepGpu(const uint8_t* h_raw_data, size_t raw_size,
     CUDA_CHECK(cudaMemsetAsync(scratch.d_sweep_bits, 0, 8 * sizeof(uint32_t), activeStream));
 
     const int summaryBlocks = (num_parsed + 255) / 256;
-    scanSweepMetadataKernel<<<summaryBlocks, 256, 0, activeStream>>>(
-        scratch.d_radials, num_parsed, scratch.d_lowest_key, scratch.d_sweep_bits);
+    {
+        const GpuParsedRadial* r = scratch.d_radials;
+        int n = num_parsed;
+        uint32_t* lk = scratch.d_lowest_key;
+        uint32_t* sb = scratch.d_sweep_bits;
+        void* args[] = { (void*)&r, (void*)&n, (void*)&lk, (void*)&sb };
+        if (!ultra_ptx::tryLaunch(ultra_ptx::k_scanSweepMetadataKernel,
+                                  (unsigned)summaryBlocks, 1, 1, 256, 1, 1,
+                                  0, activeStream, args, "scanSweepMetadata")) {
+            scanSweepMetadataKernel<<<summaryBlocks, 256, 0, activeStream>>>(
+                scratch.d_radials, num_parsed, scratch.d_lowest_key, scratch.d_sweep_bits);
+        }
+    }
     CUDA_CHECK(cudaGetLastError());
 
     uint32_t lowestKey = invalidLowestKey;
@@ -718,8 +887,18 @@ GpuIngestResult ingestSweepGpu(const uint8_t* h_raw_data, size_t raw_size,
         result.total_sweeps += countSetBits(bits);
 
     CUDA_CHECK(cudaMemsetAsync(scratch.d_selected_count, 0, sizeof(int), activeStream));
-    collectLowestSweepIndicesKernel<<<summaryBlocks, 256, 0, activeStream>>>(
-        scratch.d_radials, num_parsed, lowest_elev_num, scratch.d_indices, scratch.d_selected_count);
+    {
+        const GpuParsedRadial* r = scratch.d_radials;
+        int n = num_parsed; int e = lowest_elev_num;
+        int* idx = scratch.d_indices; int* cnt = scratch.d_selected_count;
+        void* args[] = { (void*)&r, (void*)&n, (void*)&e, (void*)&idx, (void*)&cnt };
+        if (!ultra_ptx::tryLaunch(ultra_ptx::k_collectLowestSweepIndicesKernel,
+                                  (unsigned)summaryBlocks, 1, 1, 256, 1, 1,
+                                  0, activeStream, args, "collectLowestSweepIndices")) {
+            collectLowestSweepIndicesKernel<<<summaryBlocks, 256, 0, activeStream>>>(
+                scratch.d_radials, num_parsed, lowest_elev_num, scratch.d_indices, scratch.d_selected_count);
+        }
+    }
     CUDA_CHECK(cudaGetLastError());
 
     CUDA_CHECK(cudaMemcpyAsync(&result.num_radials, scratch.d_selected_count, sizeof(int),
@@ -734,9 +913,22 @@ GpuIngestResult ingestSweepGpu(const uint8_t* h_raw_data, size_t raw_size,
 
     CUDA_CHECK(cudaMemsetAsync(scratch.d_product_meta, 0,
                                NUM_PRODUCTS * sizeof(DeviceProductMeta), activeStream));
-    for (int p = 0; p < NUM_PRODUCTS; ++p) {
-        selectProductMetaKernel<<<1, 1, 0, activeStream>>>(
-            scratch.d_radials, scratch.d_indices, result.num_radials, p, scratch.d_product_meta);
+    {
+        const GpuParsedRadial* r = scratch.d_radials;
+        const int* idx = scratch.d_indices;
+        int n = result.num_radials;
+        DeviceProductMeta* m = scratch.d_product_meta;
+        void* args[] = { (void*)&r, (void*)&idx, (void*)&n, (void*)&m };
+        if (!ultra_ptx::tryLaunch(ultra_ptx::k_selectProductMetaAllKernel,
+                                  NUM_PRODUCTS, 1, 1, 256, 1, 1,
+                                  0, activeStream, args, "selectProductMetaAll")) {
+            // Serial per-product fallback (matches original upstream behaviour).
+            for (int p = 0; p < NUM_PRODUCTS; ++p) {
+                selectProductMetaKernel<<<1, 1, 0, activeStream>>>(
+                    scratch.d_radials, scratch.d_indices, result.num_radials, p,
+                    scratch.d_product_meta);
+            }
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 
@@ -808,8 +1000,19 @@ GpuVolumeIngestResult ingestVolumeGpu(const uint8_t* h_raw_data, size_t raw_size
     CUDA_CHECK(cudaMemsetAsync(scratch.d_sweep_bits, 0, 8 * sizeof(uint32_t), activeStream));
 
     const int summaryBlocks = (num_parsed + 255) / 256;
-    scanSweepMetadataKernel<<<summaryBlocks, 256, 0, activeStream>>>(
-        scratch.d_radials, num_parsed, scratch.d_lowest_key, scratch.d_sweep_bits);
+    {
+        const GpuParsedRadial* r = scratch.d_radials;
+        int n = num_parsed;
+        uint32_t* lk = scratch.d_lowest_key;
+        uint32_t* sb = scratch.d_sweep_bits;
+        void* args[] = { (void*)&r, (void*)&n, (void*)&lk, (void*)&sb };
+        if (!ultra_ptx::tryLaunch(ultra_ptx::k_scanSweepMetadataKernel,
+                                  (unsigned)summaryBlocks, 1, 1, 256, 1, 1,
+                                  0, activeStream, args, "scanSweepMetadata(vol)")) {
+            scanSweepMetadataKernel<<<summaryBlocks, 256, 0, activeStream>>>(
+                scratch.d_radials, num_parsed, scratch.d_lowest_key, scratch.d_sweep_bits);
+        }
+    }
     CUDA_CHECK(cudaGetLastError());
 
     std::array<uint32_t, 8> sweepBits = {};

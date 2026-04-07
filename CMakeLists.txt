@@ -6,9 +6,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES native)
-endif()
+# Blackwell RTX 5090 is sm_120. Also build sm_86 (Ampere) and sm_89 (Ada)
+# real SASS, plus a compute_120 PTX fallback for newer cards.
+set(CMAKE_CUDA_ARCHITECTURES "86;89;120;120-virtual"
+    CACHE STRING "CUDA archs to compile real SASS + PTX fallback" FORCE)
 
 include(FetchContent)
 
@@ -77,6 +78,19 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 
+# Embed src/cuda/ultra_kernels.ptx into the binary as a C++ string literal
+# (configure-time substitution into ultra_kernels_ptx.h). The file is loaded
+# at runtime via the CUDA Driver API and JIT'd by the driver to native SASS.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/ultra_kernels.ptx"
+     ULTRA_PTX_CONTENT)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/ultra_kernels_ptx.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/ultra_kernels_ptx.h"
+               @ONLY)
+# Force CMake to re-run when the .ptx file changes so the embedded copy
+# stays in sync.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/ultra_kernels.ptx")
+
 add_executable(cursdar3
     src/main.cpp
     src/app.cpp
@@ -101,6 +115,7 @@ add_executable(cursdar3
 
 target_include_directories(cursdar3 PRIVATE
     src
+    "${CMAKE_CURRENT_BINARY_DIR}/generated"
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
 )
 
@@ -114,6 +129,7 @@ target_link_libraries(cursdar3 PRIVATE
     BZip2::BZip2
     nlohmann_json::nlohmann_json
     CUDA::cudart
+    CUDA::cuda_driver
 )
 
 if(WIN32)

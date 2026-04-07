@@ -1,10 +1,152 @@
 #include "renderer.cuh"
+#include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <algorithm>
 #include <vector>
+
+#include <cuda.h>            // Driver API for hand-PTX module loading
+#include "ultra_kernels_ptx.h"  // generated: const char* ultra_ptx::kSource
+#include "ultra_ptx.h"          // shared CUfunction handles for other .cu files
+
+namespace ultra_ptx {
+bool g_disablePtx = false;
+static std::vector<std::string> s_disabledKernels;
+
+bool isKernelDisabled(const char* dbg_name) {
+    if (s_disabledKernels.empty()) return false;
+    for (const auto& s : s_disabledKernels)
+        if (std::strstr(dbg_name, s.c_str())) return true;
+    return false;
+}
+
+CUfunction k_dealiasVelocityKernel        = nullptr;
+CUfunction k_ringStatsKernel              = nullptr;
+CUfunction k_zeroSuppressedGatesKernel    = nullptr;
+CUfunction k_generateUniformAzimuthsKernel = nullptr;
+CUfunction k_buildRadialMapKernel         = nullptr;
+CUfunction k_buildGateMapKernel           = nullptr;
+CUfunction k_buildTensorKernel            = nullptr;
+CUfunction k_tdsCandidateKernel           = nullptr;
+CUfunction k_hailCandidateKernel          = nullptr;
+CUfunction k_mesoCandidateKernel          = nullptr;
+CUfunction k_supportExtremumKernel        = nullptr;
+CUfunction k_compactCandidatesKernel      = nullptr;
+CUfunction k_buildVolumeKernel            = nullptr;
+CUfunction k_smoothVolumeKernel           = nullptr;
+CUfunction k_crossSectionKernel           = nullptr;
+CUfunction k_rayMarchKernel               = nullptr;
+CUfunction k_parseMsg31Kernel             = nullptr;
+CUfunction k_findMessageOffsetsKernel     = nullptr;
+CUfunction k_findVariableOffsetsKernel    = nullptr;
+CUfunction k_scanSweepMetadataKernel      = nullptr;
+CUfunction k_collectLowestSweepIndicesKernel = nullptr;
+CUfunction k_collectSweepIndicesKernel    = nullptr;
+CUfunction k_selectProductMetaAllKernel   = nullptr;
+CUfunction k_transposeKernel              = nullptr;
+CUfunction k_extractAzimuthsKernel        = nullptr;
+CUfunction k_initGridCellsKernel          = nullptr;
+CUfunction k_buildGridKernel              = nullptr;
+
+// Constant-memory mirrors. Resolved at module-load via cuModuleGetGlobal.
+static CUdeviceptr s_dp_ultraSweeps      = 0;
+static size_t      s_sz_ultraSweeps      = 0;
+static CUdeviceptr s_dp_ultraNumSweeps   = 0;
+static size_t      s_sz_ultraNumSweeps   = 0;
+static CUdeviceptr s_dp_ultraColorTable  = 0;
+static size_t      s_sz_ultraColorTable  = 0;
+
+void uploadConstSweeps(const void* host_ptr, size_t bytes) {
+    if (!s_dp_ultraSweeps || !host_ptr) return;
+    if (bytes > s_sz_ultraSweeps) bytes = s_sz_ultraSweeps;
+    cuMemcpyHtoD(s_dp_ultraSweeps, host_ptr, bytes);
+}
+void uploadConstNumSweeps(int value) {
+    if (!s_dp_ultraNumSweeps) return;
+    cuMemcpyHtoD(s_dp_ultraNumSweeps, &value, sizeof(int));
+}
+void uploadConstColorTable(const void* host_ptr, size_t bytes) {
+    if (!s_dp_ultraColorTable || !host_ptr) return;
+    if (bytes > s_sz_ultraColorTable) bytes = s_sz_ultraColorTable;
+    cuMemcpyHtoD(s_dp_ultraColorTable, host_ptr, bytes);
+}
+
+const char* err_str(CUresult res) {
+    const char* msg = nullptr;
+    cuGetErrorString(res, &msg);
+    return msg ? msg : "unknown CUDA driver error";
+}
+
+// Per-kernel launch counters. Plain unordered_map keyed by kernel name; we
+// don't expect more than 32 distinct entries so the cost is negligible. Not
+// thread-safe by itself, but launches happen on the render thread or via
+// streams owned by the worker threads so contention is rare; we wrap with a
+// mutex to be safe across the whole process.
+static std::mutex                       s_launchMu;
+static std::unordered_map<std::string, uint64_t> s_launchCounts;
+
+static void writeLaunchCountsToFile_locked() {
+    FILE* f = fopen("ultra_ptx_counts.log", "w");
+    if (!f) return;
+    std::vector<std::pair<std::string, uint64_t>> rows(
+        s_launchCounts.begin(), s_launchCounts.end());
+    std::sort(rows.begin(), rows.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    uint64_t total = 0;
+    for (const auto& r : rows) {
+        fprintf(f, "%-32s %12llu\n", r.first.c_str(),
+                (unsigned long long)r.second);
+        total += r.second;
+    }
+    fprintf(f, "%-32s %12llu (%zu distinct)\n", "TOTAL",
+            (unsigned long long)total, rows.size());
+    fclose(f);
+}
+
+void noteLaunch(const char* name) {
+    std::lock_guard<std::mutex> lk(s_launchMu);
+    auto& cnt = s_launchCounts[name];
+    cnt++;
+    // Always flush on the first sighting of a new kernel name (so the
+    // marker file shows we hit it at least once), and on every 100th launch
+    // overall. Cheap because the flush is throttled by the unique-name set.
+    static uint64_t since_flush = 0;
+    if (cnt == 1 || ++since_flush >= 100) {
+        if (since_flush >= 100) since_flush = 0;
+        writeLaunchCountsToFile_locked();
+    }
+}
+
+void dumpLaunchCounts() {
+    std::lock_guard<std::mutex> lk(s_launchMu);
+    fprintf(stderr, "[ultra-ptx] launch counts at shutdown:\n");
+    if (s_launchCounts.empty()) {
+        fprintf(stderr, "  (none)\n");
+        return;
+    }
+    std::vector<std::pair<std::string, uint64_t>> rows(
+        s_launchCounts.begin(), s_launchCounts.end());
+    std::sort(rows.begin(), rows.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    uint64_t total = 0;
+    for (const auto& r : rows) {
+        fprintf(stderr, "  %-32s %10llu\n", r.first.c_str(),
+                (unsigned long long)r.second);
+        total += r.second;
+    }
+    fprintf(stderr, "  %-32s %10llu (%zu distinct kernels)\n",
+            "TOTAL", (unsigned long long)total, rows.size());
+    writeLaunchCountsToFile_locked();
+}
+}  // namespace ultra_ptx
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -34,9 +176,17 @@ static GpuStationInfo*  d_stationInfoBuf = nullptr;
 static GpuStationPtrs*  d_stationPtrsBuf = nullptr;
 static int              d_bufSize = 0;
 
+// Dirty flags: track when persistent device-side state needs re-upload.
+// renderNative() only memcpys when these are set, eliminating the
+// ~1MB SpatialGrid + station-info round-trip every frame in show-all mode.
+static bool s_gridDirty = true;
+static bool s_stationsDirty = true;
+
 // Persistent buffers for grid construction
 static GpuStationInfo* d_gridStationsBuf = nullptr;
 static uint8_t*        d_gridActiveBuf = nullptr;
+static uint8_t*        h_gridActiveBuf = nullptr;
+static int             h_gridActiveCapacity = 0;
 static SpatialGrid*    d_gridBuildBuf = nullptr;
 static int             d_gridBuildCapacity = 0;
 
@@ -46,6 +196,168 @@ static size_t    d_forwardAccumCapacity = 0;
 
 // Host-side pointer tracking
 static GpuStationPtrs h_stationPtrs[MAX_STATIONS] = {};
+
+// ── Hand-written PTX module ─────────────────────────────────
+// Loaded once at gpu::init() from the embedded ultra_ptx::kSource string
+// via the CUDA Driver API. Each kernel below has a CUfunction handle that
+// is non-null only if the load succeeded; the call sites fall back to the
+// nvcc-compiled kernel if the handle is null, so a busted PTX edit can never
+// silently break rendering.
+static CUmodule    s_ultraModule                = nullptr;
+static CUfunction  s_ultraClearKernel           = nullptr;
+static CUfunction  s_ultraClearKernel_v4        = nullptr;  // vectorized 4-pix/thread
+static CUfunction  s_ultraForwardResolveKernel  = nullptr;
+static CUfunction  s_ultraSingleStationKernel   = nullptr;
+static CUfunction  s_ultraNativeRenderKernel    = nullptr;
+static CUfunction  s_ultraForwardRenderKernel   = nullptr;
+static bool        s_ultraLoaded                = false;
+static int         s_ultraKernelsLoaded         = 0;
+
+static const char* cuErrStr(CUresult res) {
+    const char* msg = nullptr;
+    cuGetErrorString(res, &msg);
+    return msg ? msg : "unknown CUDA driver error";
+}
+
+static bool tryLoadUltraFn(const char* name, CUfunction* out) {
+    CUresult res = cuModuleGetFunction(out, s_ultraModule, name);
+    if (res != CUDA_SUCCESS) {
+        fprintf(stderr, "[ultra-ptx] cuModuleGetFunction(%s) failed: %s\n",
+                name, cuErrStr(res));
+        *out = nullptr;
+        return false;
+    }
+    s_ultraKernelsLoaded++;
+    return true;
+}
+
+static void loadUltraKernels() {
+    if (s_ultraLoaded)
+        return;
+
+    // Read the kill-switch env vars before anything else so a broken PTX
+    // session can be recovered by setting CURSDAR3_NO_PTX=1.
+    if (const char* v = std::getenv("CURSDAR3_NO_PTX")) {
+        if (v[0] && v[0] != '0') {
+            ultra_ptx::g_disablePtx = true;
+            fprintf(stderr, "[ultra-ptx] CURSDAR3_NO_PTX set: all hand-PTX "
+                            "kernels disabled, using nvcc fallbacks only\n");
+        }
+    }
+    if (const char* v = std::getenv("CURSDAR3_NO_PTX_KERNELS")) {
+        std::string s(v);
+        size_t start = 0;
+        while (start < s.size()) {
+            size_t comma = s.find(',', start);
+            if (comma == std::string::npos) comma = s.size();
+            std::string tok = s.substr(start, comma - start);
+            if (!tok.empty()) {
+                ultra_ptx::s_disabledKernels.push_back(tok);
+                fprintf(stderr, "[ultra-ptx] disabling kernel(s) matching \"%s\"\n",
+                        tok.c_str());
+            }
+            start = comma + 1;
+        }
+    }
+
+    CUresult res = cuModuleLoadData(&s_ultraModule, ultra_ptx::kSource);
+    if (res != CUDA_SUCCESS) {
+        fprintf(stderr,
+                "[ultra-ptx] cuModuleLoadData failed: %s\n"
+                "[ultra-ptx]   falling back to nvcc-compiled kernels\n",
+                cuErrStr(res));
+        s_ultraModule = nullptr;
+        s_ultraLoaded = true;   // don't keep retrying every frame
+        return;
+    }
+
+    // Round 1-3: render path
+    tryLoadUltraFn("ultra_clearKernel",          &s_ultraClearKernel);
+    tryLoadUltraFn("ultra_clearKernel_v4",       &s_ultraClearKernel_v4);
+    tryLoadUltraFn("ultra_forwardResolveKernel", &s_ultraForwardResolveKernel);
+    tryLoadUltraFn("ultra_singleStationKernel",  &s_ultraSingleStationKernel);
+    tryLoadUltraFn("ultra_nativeRenderKernel",   &s_ultraNativeRenderKernel);
+    tryLoadUltraFn("ultra_forwardRenderKernel",  &s_ultraForwardRenderKernel);
+
+    // Round 4: data ingest / tensor reinterpolation / detection. The handles
+    // live in namespace ultra_ptx for shared access from other .cu files.
+    tryLoadUltraFn("ultra_dealiasVelocityKernel",        &ultra_ptx::k_dealiasVelocityKernel);
+    tryLoadUltraFn("ultra_ringStatsKernel",              &ultra_ptx::k_ringStatsKernel);
+    tryLoadUltraFn("ultra_zeroSuppressedGatesKernel",    &ultra_ptx::k_zeroSuppressedGatesKernel);
+    tryLoadUltraFn("ultra_generateUniformAzimuthsKernel", &ultra_ptx::k_generateUniformAzimuthsKernel);
+    tryLoadUltraFn("ultra_buildRadialMapKernel",         &ultra_ptx::k_buildRadialMapKernel);
+    tryLoadUltraFn("ultra_buildGateMapKernel",           &ultra_ptx::k_buildGateMapKernel);
+    tryLoadUltraFn("ultra_buildTensorKernel",            &ultra_ptx::k_buildTensorKernel);
+    tryLoadUltraFn("ultra_tdsCandidateKernel",           &ultra_ptx::k_tdsCandidateKernel);
+    tryLoadUltraFn("ultra_hailCandidateKernel",          &ultra_ptx::k_hailCandidateKernel);
+    tryLoadUltraFn("ultra_mesoCandidateKernel",          &ultra_ptx::k_mesoCandidateKernel);
+    tryLoadUltraFn("ultra_supportExtremumKernel",        &ultra_ptx::k_supportExtremumKernel);
+    tryLoadUltraFn("ultra_compactCandidatesKernel",      &ultra_ptx::k_compactCandidatesKernel);
+
+    // Round 5: 3D volume + cross-section.
+    tryLoadUltraFn("ultra_buildVolumeKernel",   &ultra_ptx::k_buildVolumeKernel);
+    tryLoadUltraFn("ultra_smoothVolumeKernel",  &ultra_ptx::k_smoothVolumeKernel);
+    tryLoadUltraFn("ultra_crossSectionKernel",  &ultra_ptx::k_crossSectionKernel);
+
+    // Round 6: ray-march for 3D mode (the largest single kernel, 2527 lines)
+    tryLoadUltraFn("ultra_rayMarchKernel",      &ultra_ptx::k_rayMarchKernel);
+
+    // Round 7: pipeline parsing + spatial grid construction.
+    tryLoadUltraFn("ultra_parseMsg31Kernel",                &ultra_ptx::k_parseMsg31Kernel);
+    tryLoadUltraFn("ultra_findMessageOffsetsKernel",        &ultra_ptx::k_findMessageOffsetsKernel);
+    tryLoadUltraFn("ultra_findVariableOffsetsKernel",       &ultra_ptx::k_findVariableOffsetsKernel);
+    tryLoadUltraFn("ultra_scanSweepMetadataKernel",         &ultra_ptx::k_scanSweepMetadataKernel);
+    tryLoadUltraFn("ultra_collectLowestSweepIndicesKernel", &ultra_ptx::k_collectLowestSweepIndicesKernel);
+    tryLoadUltraFn("ultra_collectSweepIndicesKernel",       &ultra_ptx::k_collectSweepIndicesKernel);
+    tryLoadUltraFn("ultra_selectProductMetaAllKernel",      &ultra_ptx::k_selectProductMetaAllKernel);
+    tryLoadUltraFn("ultra_transposeKernel",                 &ultra_ptx::k_transposeKernel);
+    tryLoadUltraFn("ultra_extractAzimuthsKernel",           &ultra_ptx::k_extractAzimuthsKernel);
+    tryLoadUltraFn("ultra_initGridCellsKernel",             &ultra_ptx::k_initGridCellsKernel);
+    tryLoadUltraFn("ultra_buildGridKernel",                 &ultra_ptx::k_buildGridKernel);
+
+    // Resolve the PTX-side constant memory mirrors so volume3d.cu can sync
+    // them whenever it does cudaMemcpyToSymbol on the original CUDA-C
+    // __constant__ globals. cuModuleGetGlobal sets both the device pointer
+    // and the byte size.
+    auto resolveGlobal = [](const char* name, CUdeviceptr* out_ptr, size_t* out_bytes) {
+        CUresult res = cuModuleGetGlobal(out_ptr, out_bytes, s_ultraModule, name);
+        if (res != CUDA_SUCCESS) {
+            fprintf(stderr, "[ultra-ptx] cuModuleGetGlobal(%s) failed: %s\n",
+                    name, ultra_ptx::err_str(res));
+            *out_ptr = 0;
+            *out_bytes = 0;
+        }
+    };
+    resolveGlobal("ultra_c_sweeps",     &ultra_ptx::s_dp_ultraSweeps,     &ultra_ptx::s_sz_ultraSweeps);
+    resolveGlobal("ultra_c_numSweeps",  &ultra_ptx::s_dp_ultraNumSweeps,  &ultra_ptx::s_sz_ultraNumSweeps);
+    resolveGlobal("ultra_c_colorTable", &ultra_ptx::s_dp_ultraColorTable, &ultra_ptx::s_sz_ultraColorTable);
+
+    // Bootstrap: uploadColorTables() ran before this loader, so the ultra
+    // mirror got a no-op upload at that time. Push the current color tables
+    // again now that the device pointer is live.
+    ultra_ptx::uploadConstColorTable(s_runtimeColorTables, sizeof(s_runtimeColorTables));
+
+    fprintf(stderr, "[ultra-ptx] loaded %d hand-written kernels from "
+                    "embedded PTX (%zu bytes of source)\n",
+            s_ultraKernelsLoaded, std::strlen(ultra_ptx::kSource));
+    fflush(stderr);
+    s_ultraLoaded = true;
+}
+
+static void unloadUltraKernels() {
+    if (s_ultraModule) {
+        cuModuleUnload(s_ultraModule);
+        s_ultraModule = nullptr;
+    }
+    s_ultraClearKernel = nullptr;
+    s_ultraClearKernel_v4 = nullptr;
+    s_ultraForwardResolveKernel = nullptr;
+    s_ultraSingleStationKernel = nullptr;
+    s_ultraNativeRenderKernel = nullptr;
+    s_ultraForwardRenderKernel = nullptr;
+    s_ultraLoaded = false;
+    s_ultraKernelsLoaded = 0;
+}
 
 static void initializeSpatialGrid(SpatialGrid* grid) {
     if (!grid) return;
@@ -332,6 +644,7 @@ static void uploadColorTables() {
     buildDefaultColorTables(s_defaultColorTables);
     memcpy(s_runtimeColorTables, s_defaultColorTables, sizeof(s_runtimeColorTables));
     CUDA_CHECK(cudaMemcpyToSymbol(c_colorTable, s_runtimeColorTables, sizeof(s_runtimeColorTables)));
+    ultra_ptx::uploadConstColorTable(s_runtimeColorTables, sizeof(s_runtimeColorTables));
     for (int p = 0; p < NUM_PRODUCTS; p++)
         uploadColorTexture(p, s_runtimeColorTables[p]);
     s_colorTexturesCreated = true;
@@ -395,7 +708,7 @@ __device__ float sampleStation(
     return value;
 }
 
-__global__ void nativeRenderKernel(
+__global__ __launch_bounds__(256, 4) void nativeRenderKernel(
     const GpuViewport vp,
     const GpuStationInfo* __restrict__ stations,
     const GpuStationPtrs* __restrict__ ptrs,
@@ -593,10 +906,18 @@ void init() {
     memset(s_stationInfo, 0, sizeof(s_stationInfo));
     memset(s_stationBufs, 0, sizeof(s_stationBufs));
     s_numStations = 0;
+
+    // Load hand-written PTX kernels into the active CUDA context. Must run
+    // after at least one runtime-API call (the cudaMalloc above) has primed
+    // a context, since cuModuleLoadData operates on the current context.
+    loadUltraKernels();
+
     printf("GPU renderer initialized (native-res mode).\n");
 }
 
 void shutdown() {
+    ultra_ptx::dumpLaunchCounts();
+    unloadUltraKernels();
     for (int i = 0; i < MAX_STATIONS; i++) freeStation(i);
     if (d_spatialGrid) { cudaFree(d_spatialGrid); d_spatialGrid = nullptr; }
     if (d_stationInfoBuf) { cudaFree(d_stationInfoBuf); d_stationInfoBuf = nullptr; }
@@ -624,6 +945,7 @@ void setColorTable(int product, const uint32_t* rgba256) {
     if (product < 0 || product >= NUM_PRODUCTS || !rgba256) return;
     memcpy(s_runtimeColorTables[product], rgba256, 256 * sizeof(uint32_t));
     CUDA_CHECK(cudaMemcpyToSymbol(c_colorTable, s_runtimeColorTables, sizeof(s_runtimeColorTables)));
+    ultra_ptx::uploadConstColorTable(s_runtimeColorTables, sizeof(s_runtimeColorTables));
     uploadColorTexture(product, s_runtimeColorTables[product]);
     s_colorTexturesCreated = true;
 }
@@ -636,6 +958,7 @@ void resetColorTable(int product) {
 void resetAllColorTables() {
     memcpy(s_runtimeColorTables, s_defaultColorTables, sizeof(s_runtimeColorTables));
     CUDA_CHECK(cudaMemcpyToSymbol(c_colorTable, s_runtimeColorTables, sizeof(s_runtimeColorTables)));
+    ultra_ptx::uploadConstColorTable(s_runtimeColorTables, sizeof(s_runtimeColorTables));
     for (int p = 0; p < NUM_PRODUCTS; p++)
         uploadColorTexture(p, s_runtimeColorTables[p]);
     s_colorTexturesCreated = true;
@@ -653,6 +976,7 @@ void allocateStation(int idx, const GpuStationInfo& info) {
         h_stationPtrs[idx].gates[p] = buf.d_gates[p];
 
     if (idx >= s_numStations) s_numStations = idx + 1;
+    s_stationsDirty = true;
 }
 
 void freeStation(int idx) {
@@ -672,6 +996,7 @@ void freeStation(int idx) {
     memset(&h_stationPtrs[idx], 0, sizeof(GpuStationPtrs));
     memset(&buf, 0, sizeof(buf));
     memset(&s_stationInfo[idx], 0, sizeof(GpuStationInfo));
+    s_stationsDirty = true;
 }
 
 void uploadStationData(int idx, const GpuStationInfo& info,
@@ -707,6 +1032,7 @@ void uploadStationData(int idx, const GpuStationInfo& info,
     h_stationPtrs[idx].azimuths = buf.d_azimuths;
     for (int p = 0; p < NUM_PRODUCTS; p++)
         h_stationPtrs[idx].gates[p] = buf.d_gates[p];
+    s_stationsDirty = true;
 }
 
 void renderNative(const GpuViewport& vp,
@@ -714,29 +1040,75 @@ void renderNative(const GpuViewport& vp,
                   const SpatialGrid& grid,
                   int product, float dbz_min,
                   uint32_t* d_output) {
-    // Upload spatial grid
-    CUDA_CHECK(cudaMemcpy(d_spatialGrid, &grid, sizeof(SpatialGrid), cudaMemcpyHostToDevice));
+    // Skip the ~1 MB SpatialGrid H->D copy when nothing changed.
+    if (s_gridDirty) {
+        CUDA_CHECK(cudaMemcpy(d_spatialGrid, &grid, sizeof(SpatialGrid),
+                              cudaMemcpyHostToDevice));
+        s_gridDirty = false;
+    }
 
-    // Resize persistent buffers if needed
+    // Resize persistent buffers if needed (forces re-upload).
     if (num_stations > d_bufSize) {
         if (d_stationInfoBuf) cudaFree(d_stationInfoBuf);
         if (d_stationPtrsBuf) cudaFree(d_stationPtrsBuf);
         CUDA_CHECK(cudaMalloc(&d_stationInfoBuf, num_stations * sizeof(GpuStationInfo)));
         CUDA_CHECK(cudaMalloc(&d_stationPtrsBuf, num_stations * sizeof(GpuStationPtrs)));
         d_bufSize = num_stations;
+        s_stationsDirty = true;
     }
-    CUDA_CHECK(cudaMemcpy(d_stationInfoBuf, stations,
-                           num_stations * sizeof(GpuStationInfo), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_stationPtrsBuf, h_stationPtrs,
-                           num_stations * sizeof(GpuStationPtrs), cudaMemcpyHostToDevice));
 
-    dim3 block(32, 8);
-    dim3 grid_dim((vp.width + 31) / 32, (vp.height + 7) / 8);
+    // Skip per-frame station info / pointer uploads when nothing changed.
+    if (s_stationsDirty) {
+        CUDA_CHECK(cudaMemcpy(d_stationInfoBuf, stations,
+                              num_stations * sizeof(GpuStationInfo),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_stationPtrsBuf, h_stationPtrs,
+                              num_stations * sizeof(GpuStationPtrs),
+                              cudaMemcpyHostToDevice));
+        s_stationsDirty = false;
+    }
 
+    const unsigned bx = 32, by = 8;
+    const unsigned gx = (vp.width  + bx - 1) / bx;
+    const unsigned gy = (vp.height + by - 1) / by;
+
+    if (s_ultraNativeRenderKernel && !ultra_ptx::g_disablePtx &&
+        !ultra_ptx::isKernelDisabled("nativeRenderKernel")) {
+        // Hand-PTX path. byval struct args (vp) need a host-side pointer to
+        // the value; the driver memcpys into the param area at launch.
+        GpuViewport          vp_local      = vp;
+        const GpuStationInfo* stations_arg = d_stationInfoBuf;
+        const GpuStationPtrs* ptrs_arg     = d_stationPtrsBuf;
+        int                   ns           = num_stations;
+        const SpatialGrid*    grid_arg     = d_spatialGrid;
+        int                   product_l    = product;
+        float                 dbz_l        = dbz_min;
+        cudaTextureObject_t   colorTex     = s_colorTextures[product];
+        uint32_t*             output_l     = d_output;
+        void* args[] = {
+            (void*)&vp_local,
+            (void*)&stations_arg, (void*)&ptrs_arg, (void*)&ns,
+            (void*)&grid_arg,
+            (void*)&product_l, (void*)&dbz_l,
+            (void*)&colorTex,
+            (void*)&output_l,
+        };
+        CUresult res = cuLaunchKernel(s_ultraNativeRenderKernel,
+                                      gx, gy, 1, bx, by, 1,
+                                      0, nullptr, args, nullptr);
+        if (res == CUDA_SUCCESS)
+            return;
+        fprintf(stderr, "[ultra-ptx] ultra_nativeRenderKernel launch "
+                        "failed: %s; falling back to nvcc\n", cuErrStr(res));
+    }
+
+    // nvcc fallback
+    dim3 block(bx, by);
+    dim3 grid_dim(gx, gy);
     nativeRenderKernel<<<grid_dim, block>>>(
         vp, d_stationInfoBuf, d_stationPtrsBuf, num_stations,
         d_spatialGrid, product, dbz_min,
-        s_colorTextures[product],  // HW-interpolated color texture
+        s_colorTextures[product],
         d_output);
 
     cudaError_t err = cudaGetLastError();
@@ -748,7 +1120,7 @@ void renderNative(const GpuViewport& vp,
 // No spatial grid, no station loop. One station, direct sampling.
 // This is the hot path for mouse-follow mode.
 
-__global__ void singleStationKernel(
+__global__ __launch_bounds__(256, 4) void singleStationKernel(
     const GpuViewport vp,
     const GpuStationInfo info,
     const float* __restrict__ azimuths,
@@ -843,7 +1215,7 @@ __global__ void singleStationKernel(
         (uint8_t)(bb*(1-tc.w) + tc.z*255*tc.w), 255);
 }
 
-__global__ void clearKernel(uint32_t* output, int width, int height, uint32_t color) {
+__global__ __launch_bounds__(256, 8) void clearKernel(uint32_t* output, int width, int height, uint32_t color) {
     int px = blockIdx.x * blockDim.x + threadIdx.x;
     int py = blockIdx.y * blockDim.y + threadIdx.y;
     if (px < width && py < height)
@@ -851,8 +1223,52 @@ __global__ void clearKernel(uint32_t* output, int width, int height, uint32_t co
 }
 
 static void clearOutputBuffer(const GpuViewport& vp, uint32_t* d_output) {
-    dim3 block(32, 8);
-    dim3 grid((vp.width + 31) / 32, (vp.height + 7) / 8);
+    const unsigned bx = 32, by = 8;
+    uint32_t color = kBackgroundColor;
+    int width  = vp.width;
+    int height = vp.height;
+
+    // Preferred: vectorized 4-pixels-per-thread version (st.global.v4.b32).
+    if (s_ultraClearKernel_v4 && !ultra_ptx::g_disablePtx &&
+        !ultra_ptx::isKernelDisabled("clearKernel_v4")) {
+        // Each thread covers 4 pixels in x; ceil-div by 4*bx for x grid.
+        const unsigned gx = (width + 4 * bx - 1) / (4 * bx);
+        const unsigned gy = (height + by - 1) / by;
+        void* args[] = { (void*)&d_output, (void*)&width, (void*)&height,
+                         (void*)&color };
+        CUresult res = cuLaunchKernel(s_ultraClearKernel_v4,
+                                      gx, gy, 1, bx, by, 1,
+                                      0, nullptr, args, nullptr);
+        if (res == CUDA_SUCCESS) {
+            ultra_ptx::noteLaunch("clearKernel_v4");
+            return;
+        }
+        fprintf(stderr, "[ultra-ptx] ultra_clearKernel_v4 launch failed: %s\n",
+                cuErrStr(res));
+    }
+
+    const unsigned gx = (width  + bx - 1) / bx;
+    const unsigned gy = (height + by - 1) / by;
+
+    // Scalar PTX fallback
+    if (s_ultraClearKernel && !ultra_ptx::g_disablePtx &&
+        !ultra_ptx::isKernelDisabled("clearKernel")) {
+        void* args[] = { (void*)&d_output, (void*)&width, (void*)&height,
+                         (void*)&color };
+        CUresult res = cuLaunchKernel(s_ultraClearKernel,
+                                      gx, gy, 1, bx, by, 1,
+                                      0, nullptr, args, nullptr);
+        if (res == CUDA_SUCCESS) {
+            ultra_ptx::noteLaunch("clearKernel");
+            return;
+        }
+        fprintf(stderr, "[ultra-ptx] ultra_clearKernel launch failed: %s\n",
+                cuErrStr(res));
+    }
+
+    // nvcc fallback (last resort)
+    dim3 block(bx, by);
+    dim3 grid(gx, gy);
     clearKernel<<<grid, block>>>(d_output, vp.width, vp.height, kBackgroundColor);
 }
 
@@ -871,12 +1287,49 @@ static void renderSingleStationInternal(const GpuViewport& vp, int station_idx,
         return;
     }
 
-    dim3 block(16, 16);
-    dim3 grid((vp.width + 15) / 16, (vp.height + 15) / 16);
+    const unsigned bx = 16, by = 16;
+    const unsigned gx = (vp.width + bx - 1) / bx;
+    const unsigned gy = (vp.height + by - 1) / by;
     size_t shared = info.num_radials * sizeof(float);
-    // Cap shared memory (48KB typical max)
-    if (shared > 48000) shared = 48000;
+    if (shared > 48000) shared = 48000;       // typical static smem cap
 
+    if (s_ultraSingleStationKernel && !ultra_ptx::g_disablePtx &&
+        !ultra_ptx::isKernelDisabled("singleStationKernel")) {
+        // Hand-PTX path. cuLaunchKernel takes byval struct args by pointer
+        // to the host-side struct value (the driver memcpys into the param
+        // area). Field order must match the PTX param decl exactly.
+        GpuViewport     vp_local      = vp;
+        GpuStationInfo  info_local    = info;
+        const float*    azimuths      = buf.d_azimuths;
+        const uint16_t* gates         = buf.d_gates[product];
+        int             product_local = product;
+        float           dbz_min_local = dbz_min;
+        cudaTextureObject_t colorTex  = s_colorTextures[product];
+        float           srv_speed_l   = srv_speed;
+        float           srv_dir_rad   = srv_dir_deg * (float)M_PI / 180.0f;
+        uint32_t*       output_local  = d_output;
+        void* args[] = {
+            (void*)&vp_local, (void*)&info_local,
+            (void*)&azimuths, (void*)&gates,
+            (void*)&product_local, (void*)&dbz_min_local,
+            (void*)&colorTex,
+            (void*)&srv_speed_l, (void*)&srv_dir_rad,
+            (void*)&output_local,
+        };
+        CUresult res = cuLaunchKernel(s_ultraSingleStationKernel,
+                                      gx, gy, 1,
+                                      bx, by, 1,
+                                      (unsigned)shared, nullptr,
+                                      args, nullptr);
+        if (res == CUDA_SUCCESS)
+            return;
+        fprintf(stderr, "[ultra-ptx] ultra_singleStationKernel launch "
+                        "failed: %s; falling back to nvcc\n", cuErrStr(res));
+    }
+
+    // nvcc fallback path
+    dim3 block(bx, by);
+    dim3 grid(gx, gy);
     singleStationKernel<<<grid, block, shared>>>(
         vp, info, buf.d_azimuths, buf.d_gates[product],
         product, dbz_min, s_colorTextures[product],
@@ -948,7 +1401,7 @@ __device__ bool pointInConvexQuad(const float2 corners[4], float px, float py) {
     return true;
 }
 
-__global__ void forwardRenderKernel(
+__global__ __launch_bounds__(256, 4) void forwardRenderKernel(
     const float* __restrict__ azimuths,
     const uint16_t* __restrict__ gates,
     GpuStationInfo info,
@@ -1019,7 +1472,7 @@ __global__ void forwardRenderKernel(
     }
 }
 
-__global__ void forwardResolveKernel(const uint64_t* __restrict__ accum,
+__global__ __launch_bounds__(256, 8) void forwardResolveKernel(const uint64_t* __restrict__ accum,
                                      int width, int height,
                                      uint32_t* __restrict__ output) {
     int px = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1057,23 +1510,84 @@ void forwardRenderStation(const GpuViewport& vp, int station_idx,
     CUDA_CHECK(cudaMemsetAsync(d_forwardAccumBuf, 0xFF, pixel_count * sizeof(uint64_t)));
 
     // Forward render: one thread per (radial, gate)
-    dim3 block(32, 8); // 256 threads, warp-aligned
-    dim3 grid((info.num_radials + 31) / 32,
-              (info.num_gates[product] + 7) / 8);
-
+    const unsigned fbx = 32, fby = 8;
+    const unsigned fgx = (info.num_radials + fbx - 1) / fbx;
+    const unsigned fgy = (info.num_gates[product] + fby - 1) / fby;
     float srv_dir_rad = srv_dir * (float)M_PI / 180.0f;
-    forwardRenderKernel<<<grid, block>>>(
-        buf.d_azimuths, buf.d_gates[product],
-        info, vp, product, dbz_min,
-        s_colorTextures[product],
-        srv_speed, srv_dir_rad,
-        d_forwardAccumBuf);
 
-    dim3 resolveBlock(32, 8);
-    dim3 resolveGrid((vp.width + 31) / 32, (vp.height + 7) / 8);
-    forwardResolveKernel<<<resolveGrid, resolveBlock>>>(d_forwardAccumBuf,
-                                                        vp.width, vp.height,
-                                                        d_output);
+    bool used_ptx = false;
+    if (s_ultraForwardRenderKernel && !ultra_ptx::g_disablePtx &&
+        !ultra_ptx::isKernelDisabled("forwardRenderKernel")) {
+        const float*    azimuths_arg = buf.d_azimuths;
+        const uint16_t* gates_arg    = buf.d_gates[product];
+        GpuStationInfo  info_local   = info;
+        GpuViewport     vp_local     = vp;
+        int             product_l    = product;
+        float           dbz_l        = dbz_min;
+        cudaTextureObject_t colorTex = s_colorTextures[product];
+        float           srv_spd_l    = srv_speed;
+        float           srv_dir_l    = srv_dir_rad;
+        uint64_t*       accum_arg    = d_forwardAccumBuf;
+        void* args[] = {
+            (void*)&azimuths_arg, (void*)&gates_arg,
+            (void*)&info_local, (void*)&vp_local,
+            (void*)&product_l, (void*)&dbz_l,
+            (void*)&colorTex,
+            (void*)&srv_spd_l, (void*)&srv_dir_l,
+            (void*)&accum_arg,
+        };
+        CUresult res = cuLaunchKernel(s_ultraForwardRenderKernel,
+                                      fgx, fgy, 1, fbx, fby, 1,
+                                      0, nullptr, args, nullptr);
+        if (res == CUDA_SUCCESS) {
+            used_ptx = true;
+        } else {
+            fprintf(stderr, "[ultra-ptx] ultra_forwardRenderKernel launch "
+                            "failed: %s; falling back to nvcc\n",
+                    cuErrStr(res));
+        }
+    }
+
+    if (!used_ptx) {
+        forwardRenderKernel<<<dim3(fgx, fgy), dim3(fbx, fby)>>>(
+            buf.d_azimuths, buf.d_gates[product],
+            info, vp, product, dbz_min,
+            s_colorTextures[product],
+            srv_speed, srv_dir_rad,
+            d_forwardAccumBuf);
+    }
+
+    const unsigned rbx = 32, rby = 8;
+    const unsigned rgx = (vp.width  + rbx - 1) / rbx;
+    const unsigned rgy = (vp.height + rby - 1) / rby;
+
+    if (s_ultraForwardResolveKernel && !ultra_ptx::g_disablePtx &&
+        !ultra_ptx::isKernelDisabled("forwardResolveKernel")) {
+        // Hand-PTX resolve. Same semantics as forwardResolveKernel but the
+        // background color is passed as a kernel parameter (the PTX doesn't
+        // close over kBackgroundColor).
+        uint64_t* accum = d_forwardAccumBuf;
+        uint32_t* out   = d_output;
+        int       w     = vp.width;
+        int       h     = vp.height;
+        uint32_t  bg    = kBackgroundColor;
+        void* args[] = { (void*)&accum, (void*)&w, (void*)&h,
+                         (void*)&out,   (void*)&bg };
+        CUresult res = cuLaunchKernel(s_ultraForwardResolveKernel,
+                                      rgx, rgy, 1,
+                                      rbx, rby, 1,
+                                      0, nullptr, args, nullptr);
+        if (res != CUDA_SUCCESS) {
+            fprintf(stderr, "[ultra-ptx] ultra_forwardResolveKernel launch "
+                            "failed: %s; falling back to nvcc\n",
+                    cuErrStr(res));
+            forwardResolveKernel<<<dim3(rgx, rgy), dim3(rbx, rby)>>>(
+                d_forwardAccumBuf, vp.width, vp.height, d_output);
+        }
+    } else {
+        forwardResolveKernel<<<dim3(rgx, rgy), dim3(rbx, rby)>>>(
+            d_forwardAccumBuf, vp.width, vp.height, d_output);
+    }
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess)
@@ -1099,6 +1613,7 @@ void swapStationPointers(int idx, const GpuStationInfo& info,
     h_stationPtrs[idx].azimuths = d_az;
     for (int p = 0; p < NUM_PRODUCTS; p++)
         h_stationPtrs[idx].gates[p] = d_g[p];
+    s_stationsDirty = true;
 }
 
 float* getStationAzimuths(int idx) {
@@ -1114,10 +1629,24 @@ uint16_t* getStationGates(int idx, int product) {
 }
 
 // ── GPU Spatial Grid Construction ───────────────────────────
+// One thread per cell. Resets the per-cell station-id array to -1.
+// Counts and bounds are zeroed/initialized separately.
+
+__global__ __launch_bounds__(256, 4) void initGridCellsKernel(SpatialGrid* __restrict__ grid) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = SPATIAL_GRID_W * SPATIAL_GRID_H;
+    if (idx >= total) return;
+    int gx = idx % SPATIAL_GRID_W;
+    int gy = idx / SPATIAL_GRID_W;
+    #pragma unroll
+    for (int s = 0; s < MAX_STATIONS_PER_CELL; ++s)
+        grid->cells[gy][gx][s] = -1;
+}
+
 // One thread per station. Each station atomically inserts itself
 // into all grid cells it covers.
 
-__global__ void buildGridKernel(
+__global__ __launch_bounds__(256, 4) void buildGridKernel(
     const GpuStationInfo* __restrict__ stations,
     const uint8_t* __restrict__ active,   // which stations have data
     int num_stations,
@@ -1157,35 +1686,86 @@ __global__ void buildGridKernel(
 
 void buildSpatialGridGpu(const GpuStationInfo* h_stations, int num_stations,
                           SpatialGrid* h_grid_out) {
-    if (!h_grid_out) return;
+    // The persistent device-side spatial grid (d_spatialGrid) is built
+    // entirely on device. We no longer round-trip a 1 MB SpatialGrid through
+    // host memory: kernels write directly into d_spatialGrid, renderNative()
+    // reads it directly, and h_grid_out is left as a vestigial host shadow
+    // (zeroed for safety) since callers don't read it after this change.
+    if (h_grid_out)
+        memset(h_grid_out, 0, sizeof(SpatialGrid));
+
     if (num_stations <= 0 || !h_stations) {
-        initializeSpatialGrid(h_grid_out);
+        // Empty grid: zero counts, cells = -1, set bounds.
+        if (d_spatialGrid) {
+            CUDA_CHECK(cudaMemset(d_spatialGrid, 0, sizeof(SpatialGrid)));
+            const unsigned blocks = (SPATIAL_GRID_W * SPATIAL_GRID_H + 255) / 256;
+            SpatialGrid* g = d_spatialGrid;
+            void* args[] = { (void*)&g };
+            if (!ultra_ptx::tryLaunch(ultra_ptx::k_initGridCellsKernel,
+                                      blocks, 1, 1, 256, 1, 1,
+                                      0, nullptr, args, "initGridCells")) {
+                initGridCellsKernel<<<blocks, 256>>>(d_spatialGrid);
+            }
+            static const float bounds[4] = { 15.0f, 72.0f, -180.0f, -60.0f };
+            CUDA_CHECK(cudaMemcpy(reinterpret_cast<uint8_t*>(d_spatialGrid)
+                                      + offsetof(SpatialGrid, min_lat),
+                                  bounds, sizeof(bounds), cudaMemcpyHostToDevice));
+        }
+        s_gridDirty = false;
         return;
     }
 
     ensureGridBuildCapacity(num_stations);
-    if (!d_gridBuildBuf)
-        CUDA_CHECK(cudaMalloc(&d_gridBuildBuf, sizeof(SpatialGrid)));
 
     CUDA_CHECK(cudaMemcpy(d_gridStationsBuf, h_stations,
                            num_stations * sizeof(GpuStationInfo), cudaMemcpyHostToDevice));
 
-    // Build active flags (station has data if num_radials > 0)
-    std::vector<uint8_t> h_active(num_stations);
+    // Persistent host scratch for the active flags (avoid per-call vector).
+    if (num_stations > h_gridActiveCapacity) {
+        if (h_gridActiveBuf) free(h_gridActiveBuf);
+        h_gridActiveBuf = (uint8_t*)malloc((size_t)num_stations);
+        h_gridActiveCapacity = num_stations;
+    }
     for (int i = 0; i < num_stations; i++)
-        h_active[i] = (h_stations[i].num_radials > 0) ? 1 : 0;
-    CUDA_CHECK(cudaMemcpy(d_gridActiveBuf, h_active.data(), num_stations * sizeof(uint8_t),
-                           cudaMemcpyHostToDevice));
+        h_gridActiveBuf[i] = (h_stations[i].num_radials > 0) ? 1 : 0;
+    CUDA_CHECK(cudaMemcpy(d_gridActiveBuf, h_gridActiveBuf,
+                           num_stations * sizeof(uint8_t), cudaMemcpyHostToDevice));
 
-    auto init_grid = std::make_unique<SpatialGrid>();
-    initializeSpatialGrid(init_grid.get());
-    CUDA_CHECK(cudaMemcpy(d_gridBuildBuf, init_grid.get(), sizeof(SpatialGrid), cudaMemcpyHostToDevice));
+    // Build directly into d_spatialGrid: zero, set cells to -1, set bounds.
+    CUDA_CHECK(cudaMemset(d_spatialGrid, 0, sizeof(SpatialGrid)));
+    {
+        const unsigned blocks = (SPATIAL_GRID_W * SPATIAL_GRID_H + 255) / 256;
+        SpatialGrid* g = d_spatialGrid;
+        void* args[] = { (void*)&g };
+        if (!ultra_ptx::tryLaunch(ultra_ptx::k_initGridCellsKernel,
+                                  blocks, 1, 1, 256, 1, 1,
+                                  0, nullptr, args, "initGridCells")) {
+            initGridCellsKernel<<<blocks, 256>>>(d_spatialGrid);
+        }
+    }
+    static const float bounds[4] = { 15.0f, 72.0f, -180.0f, -60.0f };
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<uint8_t*>(d_spatialGrid)
+                              + offsetof(SpatialGrid, min_lat),
+                          bounds, sizeof(bounds), cudaMemcpyHostToDevice));
 
-    buildGridKernel<<<(num_stations + 255) / 256, 256>>>(
-        d_gridStationsBuf, d_gridActiveBuf, num_stations, d_gridBuildBuf);
+    {
+        const unsigned blocks = (num_stations + 255) / 256;
+        const GpuStationInfo* sinfo = d_gridStationsBuf;
+        const uint8_t* active = d_gridActiveBuf;
+        int n = num_stations;
+        SpatialGrid* g = d_spatialGrid;
+        void* args[] = { (void*)&sinfo, (void*)&active, (void*)&n, (void*)&g };
+        if (!ultra_ptx::tryLaunch(ultra_ptx::k_buildGridKernel,
+                                  blocks, 1, 1, 256, 1, 1,
+                                  0, nullptr, args, "buildGrid")) {
+            buildGridKernel<<<blocks, 256>>>(
+                d_gridStationsBuf, d_gridActiveBuf, num_stations, d_spatialGrid);
+        }
+    }
     CUDA_CHECK(cudaGetLastError());
 
-    CUDA_CHECK(cudaMemcpy(h_grid_out, d_gridBuildBuf, sizeof(SpatialGrid), cudaMemcpyDeviceToHost));
+    // The grid is now fresh on device; renderNative() doesn't need to upload.
+    s_gridDirty = false;
 }
 
 } // namespace gpu
