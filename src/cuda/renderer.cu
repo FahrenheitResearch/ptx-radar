@@ -1485,6 +1485,131 @@ __global__ __launch_bounds__(256, 8) void forwardResolveKernel(const uint64_t* _
         : uint32_t(packed & 0xFFFFFFFFu);
 }
 
+
+// === FLOAT raw-output path (added for ML reprocessing) ===
+__global__ __launch_bounds__(256, 4) void forwardRenderKernelFloat(
+    const float* __restrict__ azimuths,
+    const uint16_t* __restrict__ gates,
+    GpuStationInfo info,
+    GpuViewport vp,
+    int product, float dbz_min,
+    float srv_speed, float srv_dir_rad,
+    uint64_t* __restrict__ accum)
+{
+    int ri = blockIdx.x * blockDim.x + threadIdx.x;
+    int gi = blockIdx.y * blockDim.y + threadIdx.y;
+    int nr = info.num_radials;
+    int ng = info.num_gates[product];
+    if (ri >= nr || gi >= ng) return;
+
+    uint16_t raw = __ldg(&gates[gi * nr + ri]);
+    if (raw <= 1) return;
+
+    float sc = info.scale[product], off = info.offset[product];
+    float value = ((float)raw - off) / sc;
+
+    if (srv_speed > 0.0f && product == PROD_VEL) {
+        float az_rad = __ldg(&azimuths[ri]) * ((float)M_PI / 180.0f);
+        value -= srv_speed * cosf(az_rad - srv_dir_rad);
+    }
+
+    if (!passesThreshold(product, value, dbz_min)) return;
+
+    uint32_t value_bits = __float_as_uint(value);
+
+    float az0 = radialBoundaryStartDeg(azimuths, nr, ri) * ((float)M_PI / 180.0f);
+    float az1 = radialBoundaryEndDeg(azimuths, nr, ri) * ((float)M_PI / 180.0f);
+    float gskm = info.gate_spacing_km[product];
+    float r0 = info.first_gate_km[product] + gi * gskm;
+    float r1 = r0 + gskm;
+
+    float2 c0 = polarToScreen(r0, az0, info.lat, info.lon, vp);
+    float2 c1 = polarToScreen(r1, az0, info.lat, info.lon, vp);
+    float2 c2 = polarToScreen(r1, az1, info.lat, info.lon, vp);
+    float2 c3 = polarToScreen(r0, az1, info.lat, info.lon, vp);
+
+    int ix0 = max(0, (int)floorf(fminf(fminf(c0.x, c1.x), fminf(c2.x, c3.x))));
+    int ix1 = min(vp.width - 1, (int)ceilf(fmaxf(fmaxf(c0.x, c1.x), fmaxf(c2.x, c3.x))));
+    int iy0 = max(0, (int)floorf(fminf(fminf(c0.y, c1.y), fminf(c2.y, c3.y))));
+    int iy1 = min(vp.height - 1, (int)ceilf(fmaxf(fmaxf(c0.y, c1.y), fmaxf(c2.y, c3.y))));
+
+    if (ix0 > ix1 || iy0 > iy1) return;
+
+    float2 corners[4] = {c0, c1, c2, c3};
+    uint64_t candidate = forwardDepthKey(r0 + 0.5f * gskm, value_bits);
+
+    for (int py = iy0; py <= iy1; py++) {
+        for (int px = ix0; px <= ix1; px++) {
+            float fx = (float)px + 0.5f;
+            float fy = (float)py + 0.5f;
+            if (pointInConvexQuad(corners, fx, fy))
+                atomicMin64(&accum[py * vp.width + px], candidate);
+        }
+    }
+}
+
+__global__ __launch_bounds__(256, 8) void forwardResolveKernelFloat(
+    const uint64_t* __restrict__ accum,
+    int width, int height,
+    float* __restrict__ output)
+{
+    int px = blockIdx.x * blockDim.x + threadIdx.x;
+    int py = blockIdx.y * blockDim.y + threadIdx.y;
+    if (px >= width || py >= height) return;
+
+    uint64_t packed = accum[py * width + px];
+    if (packed == kEmptyForwardPixel) {
+        output[py * width + px] = nanf("");
+    } else {
+        uint32_t bits = (uint32_t)(packed & 0xFFFFFFFFu);
+        output[py * width + px] = __uint_as_float(bits);
+    }
+}
+
+void forwardRenderStationFloat(const GpuViewport& vp, int station_idx,
+                                int product, float dbz_min, float* d_output_float,
+                                float srv_speed, float srv_dir)
+{
+    if (station_idx < 0 || station_idx >= MAX_STATIONS) {
+        size_t pixel_count = size_t(vp.width) * size_t(vp.height);
+        cudaMemset(d_output_float, 0xFF, pixel_count * sizeof(float));
+        return;
+    }
+    auto& buf = s_stationBufs[station_idx];
+    auto& info = s_stationInfo[station_idx];
+    if (!buf.allocated || !info.has_product[product] || !buf.d_gates[product]) {
+        size_t pixel_count = size_t(vp.width) * size_t(vp.height);
+        cudaMemset(d_output_float, 0xFF, pixel_count * sizeof(float));
+        return;
+    }
+
+    size_t pixel_count = size_t(vp.width) * size_t(vp.height);
+    ensureForwardAccumCapacity(pixel_count);
+    CUDA_CHECK(cudaMemsetAsync(d_forwardAccumBuf, 0xFF, pixel_count * sizeof(uint64_t)));
+
+    const unsigned fbx = 32, fby = 8;
+    const unsigned fgx = (info.num_radials + fbx - 1) / fbx;
+    const unsigned fgy = (info.num_gates[product] + fby - 1) / fby;
+    float srv_dir_rad = srv_dir * (float)M_PI / 180.0f;
+
+    forwardRenderKernelFloat<<<dim3(fgx, fgy), dim3(fbx, fby)>>>(
+        buf.d_azimuths, buf.d_gates[product],
+        info, vp, product, dbz_min,
+        srv_speed, srv_dir_rad,
+        d_forwardAccumBuf);
+
+    const unsigned rbx = 32, rby = 8;
+    const unsigned rgx = (vp.width  + rbx - 1) / rbx;
+    const unsigned rgy = (vp.height + rby - 1) / rby;
+
+    forwardResolveKernelFloat<<<dim3(rgx, rgy), dim3(rbx, rby)>>>(
+        d_forwardAccumBuf, vp.width, vp.height, d_output_float);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        fprintf(stderr, "Forward render float error: %s\n", cudaGetErrorString(err));
+}
+
 void forwardRenderStation(const GpuViewport& vp, int station_idx,
                            int product, float dbz_min, uint32_t* d_output,
                            float srv_speed, float srv_dir) {

@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include "gpu_tensor.cuh"
 #include <cuda_runtime.h>
 #include <vector>

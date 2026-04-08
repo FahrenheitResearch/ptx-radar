@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include "../nexrad/sweep_data.h"
 #include <cuda_runtime.h>
 #include <vector>

@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include "cuda_common.cuh"
 #include <cuda_runtime.h>
 #include <vector>

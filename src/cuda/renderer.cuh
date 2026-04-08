@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include "cuda_common.cuh"
 #include <cuda_runtime.h>
 
@@ -93,6 +94,14 @@ void forwardRenderStation(const GpuViewport& vp,
                            int product, float dbz_min_threshold,
                            uint32_t* d_output,
                            float srv_speed = 0.0f, float srv_dir = 0.0f);
+
+
+// Float raw-output path (added for ML reprocessing)
+void forwardRenderStationFloat(const GpuViewport& vp,
+                               int station_idx,
+                               int product, float dbz_min_threshold,
+                               float* d_output_float,
+                               float srv_speed = 0.0f, float srv_dir = 0.0f);
 
 void syncStation(int station_idx);
 

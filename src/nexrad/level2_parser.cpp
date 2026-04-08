@@ -160,7 +160,7 @@ bool decompressBZ2Stream(const uint8_t* data, size_t size, std::vector<uint8_t>&
                 success = false;
                 break;
             }
-            const size_t newCap = std::min(output.size() * 2, kMaxDecompressedBlockBytes);
+            const size_t newCap = std::min<size_t>(output.size() * 2, kMaxDecompressedBlockBytes);
             output.resize(newCap);
             strm.next_out = (char*)output.data() + totalOut;
             strm.avail_out =
@@ -302,7 +302,7 @@ static std::vector<uint8_t> decompressGzip(const std::vector<uint8_t>& data) {
     int ret = Z_OK;
     while (ret == Z_OK) {
         if (strm.total_out >= output.size()) {
-            const size_t newSize = std::min(output.size() * 2, 200u * 1024u * 1024u);
+            const size_t newSize = std::min<size_t>(output.size() * 2, 200u * 1024u * 1024u);
             if (newSize <= output.size()) {
                 inflateEnd(&strm);
                 return {};
@@ -360,7 +360,7 @@ void Level2Parser::parseMessages(const uint8_t* data, size_t size, ParsedRadarDa
             const size_t msgSize = (size_t)msize * 2;
             const size_t msgDataOffset = pos + sizeof(CtmHeader) + sizeof(MessageHeader);
             if (msgDataOffset < size) {
-                parseMsg31(data + msgDataOffset, std::min(msgSize, size - msgDataOffset), out);
+                parseMsg31(data + msgDataOffset, std::min<size_t>(msgSize, size - msgDataOffset), out);
             }
             pos += std::max(kRecordStride, msgSize + sizeof(CtmHeader));
         } else {
@@ -396,7 +396,7 @@ void Level2Parser::parseMessagesPreview(const uint8_t* data, size_t size,
             const size_t msgSize = (size_t)msize * 2;
             const size_t msgDataOffset = pos + sizeof(CtmHeader) + sizeof(MessageHeader);
             if (msgDataOffset < size) {
-                parseMsg31(data + msgDataOffset, std::min(msgSize, size - msgDataOffset), out);
+                parseMsg31(data + msgDataOffset, std::min<size_t>(msgSize, size - msgDataOffset), out);
                 if (hasUsablePreview(out))
                     break;
             }
